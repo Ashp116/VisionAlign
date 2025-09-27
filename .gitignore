@@ -1,3 +1,13 @@
 *.pt
 *.jpg
 /.venv/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# models & outputs
+*.keras
+models/
+aligned_overlay.png
