@@ -122,15 +122,34 @@ def compare_rect(ref_gray, candidate_gray):
         print(f"Comparison error: {e}")
         return 0
 
-def is_rect_in_polygon(rect_points, polygon_points):
-    """Check if rectangle overlaps with the polygon defined by selected points"""
+def is_rect_in_polygon(rect_points, polygon_points, margin_percent=5):
+    """Check if rectangle overlaps with the polygon defined by selected points, with optional margin"""
     polygon = np.array(polygon_points, dtype=np.int32)
     
-    # Check if at least 2 corners of the rectangle are inside the polygon
+    # Calculate the center of the polygon
+    center_x = np.mean(polygon[:, 0])
+    center_y = np.mean(polygon[:, 1])
+    
+    # Expand the polygon by the margin percentage
+    expanded_polygon = []
+    for point in polygon:
+        # Calculate vector from center to point
+        dx = point[0] - center_x
+        dy = point[1] - center_y
+        
+        # Expand by margin percentage
+        expanded_x = center_x + dx * (1 + margin_percent / 100.0)
+        expanded_y = center_y + dy * (1 + margin_percent / 100.0)
+        
+        expanded_polygon.append([int(expanded_x), int(expanded_y)])
+    
+    expanded_polygon = np.array(expanded_polygon, dtype=np.int32)
+    
+    # Check if at least 2 corners of the rectangle are inside the expanded polygon
     # This is more flexible than requiring all corners to be inside
     inside_count = 0
     for point in rect_points:
-        result = cv2.pointPolygonTest(polygon, (int(point[0]), int(point[1])), False)
+        result = cv2.pointPolygonTest(expanded_polygon, (int(point[0]), int(point[1])), False)
         if result >= 0:  # Point is inside or on boundary
             inside_count += 1
     
@@ -158,6 +177,10 @@ converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
 frame_counter = 0
 best_pts = None
 best_score = -1
+best_outside_pts = None
+best_outside_score = -1
+best_bbox_pts = None
+best_outside_bbox_pts = None
 
 # Create window and set mouse callback for point selection
 cv2.namedWindow("Rectangle Detection & Matching", cv2.WINDOW_AUTOSIZE)
@@ -176,6 +199,11 @@ print("Optional: Click 4 points on the image to define search region")
 print("Press 'c' to confirm points and start tracking (or skip region selection)")
 print("Press 'r' to reset points")
 print("Press 'q' to quit")
+print("\n=== DETECTION COLORS ===")
+print("GREEN: Objects detected inside the region (above threshold)")
+print("ORANGE: Objects detected inside the region (below threshold)")
+print("MAGENTA: Objects detected outside the region (above threshold)")
+print("PURPLE: Objects detected outside the region (below threshold)")
 print("\n=== TRACKING MODE CONTROLS (after setup) ===")
 print("Press '+' to increase threshold")
 print("Press '-' to decrease threshold") 
@@ -219,10 +247,14 @@ while camera.IsGrabbing():
                     cv2.line(display_frame, selected_points[i], selected_points[i+1], (255, 0, 0), 2)
             
             # Instructions
-            cv2.putText(display_frame, f"Points: {len(selected_points)}/4 (Optional)", (10, 30),
+            cv2.putText(display_frame, f"Points: {len(selected_points)}/4 (REQUIRED)", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(display_frame, "Define search region or press 'c' to skip", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if len(selected_points) < 4:
+                cv2.putText(display_frame, "Click 4 points to define the search region", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            else:
+                cv2.putText(display_frame, "All points selected! Press 'c' to confirm", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             if len(selected_points) == 4:
                 cv2.putText(display_frame, "Press 'c' to confirm, 'r' to reset", (10, 90),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -234,22 +266,19 @@ while camera.IsGrabbing():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('c'):  # Allow skipping region selection
+            elif key == ord('c'):  # Require 4 points before confirming
                 if len(selected_points) == 4:
                     # Confirm points and start tracking
                     extract_reference_region(frame_resized, selected_points)
                     print("=== TRACKING MODE ===")
                     print("Search region defined. Now tracking the reference object...")
+                    print("Press 'q' to quit")
                 else:
-                    # Skip region selection and track in full frame
-                    setup_complete = True
-                    print("=== TRACKING MODE ===")
-                    print("Tracking reference object in full frame...")
-                print("Press 'q' to quit")
+                    print(f"Please select all 4 points first. Currently selected: {len(selected_points)}/4")
             elif key == ord('r'):
                 # Reset points
                 selected_points = []
-                print("Points reset. Click 4 new points or press 'c' to skip region.")
+                print("Points reset. Click 4 new points to define the region.")
                 
         else:
             # Tracking mode - original detection logic
@@ -274,15 +303,22 @@ while camera.IsGrabbing():
 
                 contours, hierarchy = cv2.findContours(edges_combined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-                best_score = -1
-                best_pts = None
+                # Reset detection variables for this frame
+                current_best_score = -1
+                current_best_pts = None
+                current_best_outside_score = -1
+                current_best_outside_pts = None
+                current_best_bbox_pts = None
+                current_best_outside_bbox_pts = None
                 rectangles_found = 0
                 rectangles_in_region = 0
+                rectangles_outside_region = 0
                 all_candidates = []  # Store all candidates for debugging
+                outside_candidates = []  # Store candidates outside the region
 
                 for cnt in contours:
                     # Try different approximation levels
-                    for epsilon_factor in [0.02, 0.03, 0.04, 0.05]:
+                    for epsilon_factor in [0.02, 0.03, 0.04, 0.4]:
                         approx = cv2.approxPolyDP(cnt, epsilon_factor * cv2.arcLength(cnt, True), True)
                         if len(approx) == 4:
                             rectangles_found += 1
@@ -318,38 +354,99 @@ while camera.IsGrabbing():
                             angle_ok = all(45 <= a <= 135 for a in angles)
                             
                             if angle_ok:
-                                # Check if the detected rectangle is within our defined polygon region
-                                if is_rect_in_polygon(pts, selected_points):
-                                    rectangles_in_region += 1
-                                    candidate = gray_frame[y:y+h, x:x+w]
+                                candidate = gray_frame[y:y+h, x:x+w]
+                                
+                                try:
+                                    score = compare_rect(ref_gray, candidate)
                                     
-                                    try:
-                                        score = compare_rect(ref_gray, candidate)
-                                        all_candidates.append((pts, score, w, h))
+                                    # Check if the detected rectangle is within our defined polygon region
+                                    if len(selected_points) == 4 and is_rect_in_polygon(pts, selected_points):
+                                        # Inside region
+                                        rectangles_in_region += 1
+                                        # Store both contour points and bounding rect for flexibility
+                                        bbox_pts = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
+                                        all_candidates.append((pts, bbox_pts, score, w, h, x, y))
                                         
                                         if debug_mode:
-                                            print(f"Rectangle {rectangles_in_region}: Score = {score:.3f}, Size: {w}x{h}")
-                                    except (cv2.error, ZeroDivisionError, Exception) as e:
-                                        if debug_mode:
-                                            print(f"Error processing candidate: {e}")
-                                        continue
+                                            print(f"Rectangle IN region {rectangles_in_region}: Score = {score:.3f}, Size: {w}x{h}")
                                         
-                                    if score > best_score:
-                                        best_score = score
-                                        best_pts = pts
+                                        if score > current_best_score:
+                                            current_best_score = score
+                                            current_best_pts = pts
+                                            current_best_bbox_pts = bbox_pts
+                                    elif len(selected_points) == 4:
+                                        # Outside region (only when region is defined)
+                                        
+                                        # Filter out small, low-confidence outside detections (likely noise)
+                                        MIN_OUTSIDE_SIZE_FOR_LOW_CONFIDENCE = 100  # Minimum size for low-confidence outside detections
+                                        
+                                        # If detection is below threshold and small, ignore it
+                                        if score < MATCH_THRESHOLD and (w < MIN_OUTSIDE_SIZE_FOR_LOW_CONFIDENCE or h < MIN_OUTSIDE_SIZE_FOR_LOW_CONFIDENCE):
+                                            if debug_mode:
+                                                print(f"Rectangle OUTSIDE region IGNORED (too small + low confidence): Score = {score:.3f}, Size: {w}x{h}")
+                                            continue  # Skip this detection
+                                        
+                                        rectangles_outside_region += 1
+                                        # Store both contour points and bounding rect for flexibility
+                                        bbox_pts = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
+                                        outside_candidates.append((pts, bbox_pts, score, w, h, x, y))
+                                        
+                                        if debug_mode:
+                                            print(f"Rectangle OUTSIDE region {rectangles_outside_region}: Score = {score:.3f}, Size: {w}x{h}")
+                                        
+                                        if score > current_best_outside_score:
+                                            current_best_outside_score = score
+                                            current_best_outside_pts = pts
+                                            current_best_outside_bbox_pts = bbox_pts
+                                    else:
+                                        # No region defined - treat all as "inside"
+                                        rectangles_in_region += 1
+                                        # Store both contour points and bounding rect for flexibility
+                                        bbox_pts = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
+                                        all_candidates.append((pts, bbox_pts, score, w, h, x, y))
+                                        
+                                        if debug_mode:
+                                            print(f"Rectangle (no region) {rectangles_in_region}: Score = {score:.3f}, Size: {w}x{h}")
+                                        
+                                        if score > current_best_score:
+                                            current_best_score = score
+                                            current_best_pts = pts
+                                            current_best_bbox_pts = bbox_pts
+                                            
+                                except (cv2.error, ZeroDivisionError, Exception) as e:
+                                    if debug_mode:
+                                        print(f"Error processing candidate: {e}")
+                                    continue
                             break  # Found a valid 4-sided approximation, move to next contour
                 
                 # Post-process candidates to find the best match
                 if all_candidates:
                     # Sort by score and take the best
-                    all_candidates.sort(key=lambda x: x[1], reverse=True)
-                    best_pts, best_score = all_candidates[0][0], all_candidates[0][1]
+                    all_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score (index 2)
+                    current_best_pts, current_best_bbox_pts, current_best_score = all_candidates[0][0], all_candidates[0][1], all_candidates[0][2]
+                
+                # Post-process outside candidates too
+                if outside_candidates:
+                    # Sort by score and take the best
+                    outside_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score (index 2)
+                    current_best_outside_pts, current_best_outside_bbox_pts, current_best_outside_score = outside_candidates[0][0], outside_candidates[0][1], outside_candidates[0][2]
+                
+                # Update global variables with current frame's best detections
+                best_score = current_best_score
+                best_pts = current_best_pts
+                best_outside_score = current_best_outside_score
+                best_outside_pts = current_best_outside_pts
+                best_bbox_pts = current_best_bbox_pts
+                best_outside_bbox_pts = current_best_outside_bbox_pts
                 
                 if debug_mode and frame_counter % (DETECTION_SKIP * 4) == 0:  # Print every 4th detection cycle
-                    print(f"Found {rectangles_found} rectangles, {rectangles_in_region} in region")
-                    print(f"Best score: {best_score:.3f}, Total candidates: {len(all_candidates)}")
+                    print(f"Found {rectangles_found} rectangles, {rectangles_in_region} in region, {rectangles_outside_region} outside")
+                    print(f"Best inside score: {current_best_score:.3f}, Best outside score: {current_best_outside_score:.3f}")
+                    print(f"Inside candidates: {len(all_candidates)}, Outside candidates: {len(outside_candidates)}")
                     if len(all_candidates) > 0:
-                        print(f"Top 3 candidates: {[(c[1], c[2], c[3]) for c in all_candidates[:3]]}")
+                        print(f"Top 3 inside candidates: {[(c[2], c[3], c[4]) for c in all_candidates[:3]]}")  # score, w, h
+                    if len(outside_candidates) > 0:
+                        print(f"Top 3 outside candidates: {[(c[2], c[3], c[4]) for c in outside_candidates[:3]]}")  # score, w, h
 
             # --- Draw detection results ---
             display_frame = frame_resized.copy()
@@ -364,12 +461,75 @@ while camera.IsGrabbing():
                 cv2.addWeighted(overlay, 0.2, display_frame, 0.8, 0, display_frame)
                 # Draw polygon outline
                 cv2.polylines(display_frame, [pts], True, (255, 255, 0), 2)
+                
+                # Show 5% margin area in debug mode
+                if debug_mode:
+                    # Calculate expanded polygon for visualization
+                    center_x = np.mean([p[0] for p in selected_points])
+                    center_y = np.mean([p[1] for p in selected_points])
+                    
+                    expanded_points = []
+                    for point in selected_points:
+                        dx = point[0] - center_x
+                        dy = point[1] - center_y
+                        expanded_x = center_x + dx * 1.05  # 5% expansion
+                        expanded_y = center_y + dy * 1.05
+                        expanded_points.append([int(expanded_x), int(expanded_y)])
+                    
+                    expanded_pts = np.array(expanded_points, np.int32)
+                    expanded_pts = expanded_pts.reshape((-1, 1, 2))
+                    # Draw expanded region with dotted line effect
+                    cv2.polylines(display_frame, [expanded_pts], True, (0, 255, 255), 1)  # Cyan dashed outline
+                    cv2.putText(display_frame, "5% Margin", (expanded_points[0][0], expanded_points[0][1] - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                
+                # Add center crosshair for alignment reference
+                # Only show TARGET when guidance is actually needed
+                show_target = False
+                
+                # Check if inside detection needs guidance
+                if best_pts is not None and best_score < MATCH_THRESHOLD:
+                    # Calculate if inside object needs guidance
+                    if best_bbox_pts is not None:
+                        bbox_center_x, bbox_center_y = cv2.boundingRect(best_bbox_pts)[:2]
+                        bbox_center_x += cv2.boundingRect(best_bbox_pts)[2] // 2
+                        bbox_center_y += cv2.boundingRect(best_bbox_pts)[3] // 2
+                        region_center_x = sum(p[0] for p in selected_points) // 4
+                        region_center_y = sum(p[1] for p in selected_points) // 4
+                        dx = region_center_x - bbox_center_x
+                        dy = region_center_y - bbox_center_y
+                        distance = np.sqrt(dx*dx + dy*dy)
+                        if distance > 40:  # Same PROXIMITY_THRESHOLD as in guidance logic
+                            show_target = True
+                
+                # Check if outside detection needs guidance
+                if best_outside_pts is not None and best_outside_score < MATCH_THRESHOLD:
+                    show_target = True  # Outside detections always need guidance to move into region
+                
+                # Only draw crosshair if guidance is actually needed
+                if show_target:
+                    region_center_x = sum(p[0] for p in selected_points) // 4
+                    region_center_y = sum(p[1] for p in selected_points) // 4
+                    # Draw crosshair at region center
+                    cv2.line(display_frame, (region_center_x - 15, region_center_y), (region_center_x + 15, region_center_y), (255, 255, 255), 2)
+                    cv2.line(display_frame, (region_center_x, region_center_y - 15), (region_center_x, region_center_y + 15), (255, 255, 255), 2)
+                    cv2.circle(display_frame, (region_center_x, region_center_y), 5, (255, 255, 255), 2)
+                    cv2.putText(display_frame, "TARGET", (region_center_x + 20, region_center_y - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             
-            # Show current best score for debugging (always show if we have any score)
+            # Show current best scores for debugging
+            score_y_offset = 30
             if best_score > 0:
-                color = (0, 255, 0) if best_score >= MATCH_THRESHOLD else (0, 165, 255)  # Green if above threshold, Orange if below
-                cv2.putText(display_frame, f"Best Score: {best_score:.3f} (Threshold: {MATCH_THRESHOLD})", (10, 30),
+                color = (0, 255, 0)  # Always green for inside score
+                cv2.putText(display_frame, f"Inside Score: {best_score:.3f} (Threshold: {MATCH_THRESHOLD})", (10, score_y_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                score_y_offset += 25
+            
+            if best_outside_score > 0:
+                color = (255, 0, 255) if best_outside_score >= MATCH_THRESHOLD else (128, 0, 128)  # Magenta if above threshold, Purple if below
+                cv2.putText(display_frame, f"Outside Score: {best_outside_score:.3f}", (10, score_y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                score_y_offset += 25
             
             # Show additional info
             cv2.putText(display_frame, f"Frame: {frame_counter}", (10, display_frame.shape[0] - 60),
@@ -379,53 +539,306 @@ while camera.IsGrabbing():
             cv2.putText(display_frame, f"Features: {len(ref_keypoints) if ref_keypoints else 0}", (10, display_frame.shape[0] - 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
+            # Draw detection results for objects inside the region
+            detection_y_offset = 60
             if best_pts is not None and best_score >= MATCH_THRESHOLD:
+                # High confidence: use original contour points for more precise shape
                 cv2.polylines(display_frame, [best_pts], isClosed=True, color=(0, 255, 0), thickness=3)
                 for x, y in best_pts:
                     cv2.circle(display_frame, (x, y), 5, (0, 0, 255), -1)
-                cv2.putText(display_frame, "DETECTED IN REGION", (10, 60),
+                cv2.putText(display_frame, "DETECTED IN REGION", (10, detection_y_offset),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            elif best_pts is not None:  # Show detection but below threshold
-                cv2.polylines(display_frame, [best_pts], isClosed=True, color=(0, 165, 255), thickness=2)  # Orange outline
-                cv2.putText(display_frame, "DETECTED (Below Threshold)", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                detection_y_offset += 30
+                
+                # Add arrow to target even for high confidence detections
+                if len(selected_points) == 4 and best_bbox_pts is not None:
+                    region_center_x = sum(p[0] for p in selected_points) // 4
+                    region_center_y = sum(p[1] for p in selected_points) // 4
+                    bbox_center_x, bbox_center_y = cv2.boundingRect(best_bbox_pts)[:2]
+                    bbox_center_x += cv2.boundingRect(best_bbox_pts)[2] // 2
+                    bbox_center_y += cv2.boundingRect(best_bbox_pts)[3] // 2
+                    
+                    # Draw arrow FROM object center TO region center (green for high confidence)
+                    cv2.arrowedLine(display_frame, 
+                                   (bbox_center_x, bbox_center_y), 
+                                   (region_center_x, region_center_y), 
+                                   (0, 255, 0), 2, tipLength=0.2)
+                    
+                    # Add a circle at object position
+                    cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 6, (0, 255, 0), 2)
+                    cv2.putText(display_frame, "OK", (bbox_center_x + 8, bbox_center_y - 8),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+            elif best_pts is not None and best_bbox_pts is not None:  # Low confidence detection
+                # Low confidence: use precise bounding rectangle but don't show visual outline
+                # Only show guidance text if needed, no orange visuals
+                
+                # Add alignment guidance text with position information
+                if len(selected_points) == 4:
+                    # Calculate center of the defined region
+                    region_center_x = sum(p[0] for p in selected_points) // 4
+                    region_center_y = sum(p[1] for p in selected_points) // 4
+                    
+                    # Calculate center of detected object
+                    bbox_center_x, bbox_center_y = cv2.boundingRect(best_bbox_pts)[:2]
+                    bbox_center_x += cv2.boundingRect(best_bbox_pts)[2] // 2
+                    bbox_center_y += cv2.boundingRect(best_bbox_pts)[3] // 2
+                    
+                    # Calculate distance from object center to region center
+                    dx = region_center_x - bbox_center_x
+                    dy = region_center_y - bbox_center_y
+                    distance = np.sqrt(dx*dx + dy*dy)
+                    
+                    # Define proximity threshold (adjust this value as needed)
+                    PROXIMITY_THRESHOLD = 40  # pixels - only show guidance if object is more than 40 pixels from center
+                    
+                    # Only show guidance if object is significantly misaligned
+                    if distance > PROXIMITY_THRESHOLD:
+                        guidance = "Match camera to the "
+                        arrow_directions = []  # Store arrow directions to draw
+                        
+                        if abs(dx) > 20 or abs(dy) > 20:  # If significantly off-center
+                            if dx > 20:
+                                guidance += "left side "
+                                arrow_directions.append("LEFT")
+                            elif dx < -20:
+                                guidance += "right side "
+                                arrow_directions.append("RIGHT")
+                            if dy > 20:
+                                guidance += "upper area "
+                                arrow_directions.append("UP")
+                            elif dy < -20:
+                                guidance += "lower area "
+                                arrow_directions.append("DOWN")
+                            guidance += "of the reference region"
+                        else:
+                            guidance += "center of the reference region"
+                            arrow_directions.append("CENTER")
+                        
+                        # Draw arrow FROM object center TO region center
+                        cv2.arrowedLine(display_frame, 
+                                       (bbox_center_x, bbox_center_y), 
+                                       (region_center_x, region_center_y), 
+                                       (255, 255, 0), 3, tipLength=0.2)
+                        
+                        # Add a circle at object position to show start point
+                        cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 255, 0), 2)
+                        cv2.putText(display_frame, "OBJ", (bbox_center_x + 10, bbox_center_y - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                        
+                        # Draw directional arrows around the guidance text (smaller, supplementary)
+                        text_x = 10
+                        text_y = detection_y_offset
+                        
+                        # Draw small supplementary arrows based on direction
+                        for i, direction in enumerate(arrow_directions):
+                            offset_x = i * 15  # Spread arrows horizontally if multiple
+                            if direction == "LEFT":
+                                cv2.arrowedLine(display_frame, (text_x - 30 + offset_x, text_y - 5), (text_x - 15 + offset_x, text_y - 5), (255, 255, 0), 1, tipLength=0.5)
+                            elif direction == "RIGHT":
+                                cv2.arrowedLine(display_frame, (text_x - 30 + offset_x, text_y - 5), (text_x - 15 + offset_x, text_y - 5), (255, 255, 0), 1, tipLength=0.5)
+                            elif direction == "UP":
+                                cv2.arrowedLine(display_frame, (text_x - 22 + offset_x, text_y + 2), (text_x - 22 + offset_x, text_y - 12), (255, 255, 0), 1, tipLength=0.5)
+                            elif direction == "DOWN":
+                                cv2.arrowedLine(display_frame, (text_x - 22 + offset_x, text_y - 12), (text_x - 22 + offset_x, text_y + 2), (255, 255, 0), 1, tipLength=0.5)
+                            elif direction == "CENTER":
+                                cv2.circle(display_frame, (text_x - 22 + offset_x, text_y - 5), 4, (255, 255, 0), 1)
+                                cv2.circle(display_frame, (text_x - 22 + offset_x, text_y - 5), 2, (255, 255, 0), -1)
+                        
+                        cv2.putText(display_frame, guidance, (text_x, text_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)  # Cyan text for visibility
+                        detection_y_offset += 25
+                        cv2.putText(display_frame, "Align object properly for better detection", (10, detection_y_offset),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        detection_y_offset += 25
+                    # If object is close to center, don't show any guidance messages
+                else:
+                    # Fallback when no region is defined
+                    cv2.putText(display_frame, "Match camera to the reference template position", (10, detection_y_offset),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    detection_y_offset += 25
+                    cv2.putText(display_frame, "Align object properly for better detection", (10, detection_y_offset),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    detection_y_offset += 25
+            
+            # Draw detection results for objects outside the region
+            if best_outside_pts is not None and best_outside_score >= MATCH_THRESHOLD:
+                # High confidence: use original contour points for more precise shape
+                cv2.polylines(display_frame, [best_outside_pts], isClosed=True, color=(255, 0, 255), thickness=3)  # Magenta for outside detection
+                for x, y in best_outside_pts:
+                    cv2.circle(display_frame, (x, y), 5, (255, 255, 0), -1)  # Cyan circles
+                cv2.putText(display_frame, "DETECTED OUTSIDE REGION", (10, detection_y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                detection_y_offset += 30
+                
+                # Add arrow to target for high confidence outside detections
+                if len(selected_points) == 4 and best_outside_bbox_pts is not None:
+                    region_center_x = sum(p[0] for p in selected_points) // 4
+                    region_center_y = sum(p[1] for p in selected_points) // 4
+                    bbox_center_x, bbox_center_y = cv2.boundingRect(best_outside_bbox_pts)[:2]
+                    bbox_center_x += cv2.boundingRect(best_outside_bbox_pts)[2] // 2
+                    bbox_center_y += cv2.boundingRect(best_outside_bbox_pts)[3] // 2
+                    
+                    # Draw arrow FROM outside object TO region center (magenta for outside)
+                    cv2.arrowedLine(display_frame, 
+                                   (bbox_center_x, bbox_center_y), 
+                                   (region_center_x, region_center_y), 
+                                   (255, 0, 255), 2, tipLength=0.2)
+                    
+                    # Add a circle at outside object position
+                    cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 6, (255, 0, 255), 2)
+                    cv2.putText(display_frame, "HIGH", (bbox_center_x + 8, bbox_center_y - 8),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 1)
+            elif best_outside_pts is not None and best_outside_bbox_pts is not None:  # Low confidence detection
+                # Low confidence: use precise bounding rectangle for accurate size/position
+                cv2.polylines(display_frame, [best_outside_bbox_pts], isClosed=True, color=(128, 0, 128), thickness=2)  # Purple outline
+                for x, y in best_outside_bbox_pts:
+                    cv2.circle(display_frame, (x, y), 3, (128, 0, 128), -1)
+                cv2.putText(display_frame, "DETECTED OUTSIDE (Below Threshold)", (10, detection_y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 0, 128), 2)
+                detection_y_offset += 25
+                
+                # Add alignment guidance text with position information for outside detection
+                if len(selected_points) == 4:
+                    # Calculate center of the defined region
+                    region_center_x = sum(p[0] for p in selected_points) // 4
+                    region_center_y = sum(p[1] for p in selected_points) // 4
+                    
+                    # Calculate center of detected object
+                    bbox_center_x, bbox_center_y = cv2.boundingRect(best_outside_bbox_pts)[:2]
+                    bbox_center_x += cv2.boundingRect(best_outside_bbox_pts)[2] // 2
+                    bbox_center_y += cv2.boundingRect(best_outside_bbox_pts)[3] // 2
+                    
+                    # Determine direction to move camera to bring object into region
+                    dx = bbox_center_x - region_center_x  # Positive means object is to the right of region
+                    dy = bbox_center_y - region_center_y  # Positive means object is below region
+                    
+                    guidance = "Move camera "
+                    arrow_directions = []  # Store arrow directions for outside detection
+                    
+                    if abs(dx) > 20 or abs(dy) > 20:  # If significantly off-center
+                        if dx > 20:
+                            guidance += "left "  # Move camera left to bring right object into view
+                            arrow_directions.append("LEFT")
+                        elif dx < -20:
+                            guidance += "right "  # Move camera right to bring left object into view
+                            arrow_directions.append("RIGHT")
+                        if dy > 20:
+                            guidance += "up "  # Move camera up to bring lower object into view
+                            arrow_directions.append("UP")
+                        elif dy < -20:
+                            guidance += "down "  # Move camera down to bring upper object into view
+                            arrow_directions.append("DOWN")
+                        guidance += "to align with reference region"
+                    else:
+                        guidance += "slightly to align with reference region"
+                        arrow_directions.append("CENTER")
+                else:
+                    guidance = "Move camera to align with reference template"
+                    arrow_directions.append("CENTER")
+                
+                # Draw directional arrows for outside detection
+                text_x = 10
+                text_y = detection_y_offset
+                
+                # Draw main arrow FROM outside object TO region center
+                cv2.arrowedLine(display_frame, 
+                               (bbox_center_x, bbox_center_y), 
+                               (region_center_x, region_center_y), 
+                               (255, 0, 255), 3, tipLength=0.2)
+                
+                # Add a circle at outside object position to show start point
+                cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 0, 255), 2)
+                cv2.putText(display_frame, "OUT", (bbox_center_x + 10, bbox_center_y - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                
+                # Draw small supplementary arrows based on direction (using magenta color for outside detection)
+                for i, direction in enumerate(arrow_directions):
+                    offset_x = i * 15  # Spread arrows horizontally if multiple
+                    if direction == "LEFT":
+                        cv2.arrowedLine(display_frame, (text_x - 30 + offset_x, text_y - 5), (text_x - 15 + offset_x, text_y - 5), (255, 0, 255), 1, tipLength=0.5)
+                    elif direction == "RIGHT":
+                        cv2.arrowedLine(display_frame, (text_x - 30 + offset_x, text_y - 5), (text_x - 15 + offset_x, text_y - 5), (255, 0, 255), 1, tipLength=0.5)
+                    elif direction == "UP":
+                        cv2.arrowedLine(display_frame, (text_x - 22 + offset_x, text_y + 2), (text_x - 22 + offset_x, text_y - 12), (255, 0, 255), 1, tipLength=0.5)
+                    elif direction == "DOWN":
+                        cv2.arrowedLine(display_frame, (text_x - 22 + offset_x, text_y - 12), (text_x - 22 + offset_x, text_y + 2), (255, 0, 255), 1, tipLength=0.5)
+                    elif direction == "CENTER":
+                        cv2.circle(display_frame, (text_x - 22 + offset_x, text_y - 5), 6, (255, 0, 255), 1)
+                        cv2.circle(display_frame, (text_x - 22 + offset_x, text_y - 5), 3, (255, 0, 255), 1)
+                        cv2.circle(display_frame, (text_x - 22 + offset_x, text_y - 5), 1, (255, 0, 255), -1)
+                
+                cv2.putText(display_frame, guidance, (text_x, text_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)  # Magenta text for visibility
+                detection_y_offset += 25
+                cv2.putText(display_frame, "Bring object into the defined region", (10, detection_y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+                detection_y_offset += 25
             
             # Show candidate rectangles in debug mode
-            if debug_mode and 'all_candidates' in locals() and len(all_candidates) > 1:
-                for i, (pts, score, w, h) in enumerate(all_candidates[1:4]):  # Show top 3 additional candidates
-                    if pts is not None:
-                        color = (128, 128, 128)  # Gray for other candidates
-                        cv2.polylines(display_frame, [pts], isClosed=True, color=color, thickness=1)
-                        # Show score near the rectangle
-                        x, y, _, _ = cv2.boundingRect(pts)
-                        cv2.putText(display_frame, f"{score:.2f}", (x, y-5),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            if debug_mode:
+                # Show additional inside candidates
+                if 'all_candidates' in locals() and len(all_candidates) > 1:
+                    for i, candidate_data in enumerate(all_candidates[1:4]):  # Show top 3 additional candidates
+                        pts, bbox_pts, score, w, h = candidate_data[0], candidate_data[1], candidate_data[2], candidate_data[3], candidate_data[4]
+                        if pts is not None:
+                            color = (128, 128, 128)  # Gray for other inside candidates
+                            # Use bbox for consistency in debug mode
+                            cv2.polylines(display_frame, [bbox_pts], isClosed=True, color=color, thickness=1)
+                            # Show score near the rectangle
+                            x, y, _, _ = cv2.boundingRect(bbox_pts)
+                            cv2.putText(display_frame, f"IN:{score:.2f}", (x, y-5),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                
+                # Show additional outside candidates
+                if 'outside_candidates' in locals() and len(outside_candidates) > 1:
+                    for i, candidate_data in enumerate(outside_candidates[1:4]):  # Show top 3 additional candidates
+                        pts, bbox_pts, score, w, h = candidate_data[0], candidate_data[1], candidate_data[2], candidate_data[3], candidate_data[4]
+                        if pts is not None:
+                            color = (64, 0, 64)  # Dark purple for other outside candidates
+                            # Use bbox for consistency in debug mode
+                            cv2.polylines(display_frame, [bbox_pts], isClosed=True, color=color, thickness=1)
+                            # Show score near the rectangle
+                            x, y, _, _ = cv2.boundingRect(bbox_pts)
+                            cv2.putText(display_frame, f"OUT:{score:.2f}", (x, y-5),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
             cv2.imshow("Rectangle Detection & Matching", display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('+') or key == ord('='):  # Increase threshold
-                MATCH_THRESHOLD = min(1.0, MATCH_THRESHOLD + 0.05)
+                MATCH_THRESHOLD = min(1.0, MATCH_THRESHOLD + 0.4)
                 print(f"Threshold increased to: {MATCH_THRESHOLD:.2f}")
             elif key == ord('-'):  # Decrease threshold
-                MATCH_THRESHOLD = max(0.0, MATCH_THRESHOLD - 0.05)
+                MATCH_THRESHOLD = max(0.0, MATCH_THRESHOLD - 0.4)
                 print(f"Threshold decreased to: {MATCH_THRESHOLD:.2f}")
             elif key == ord('d'):  # Toggle debug mode
                 debug_mode = not debug_mode
                 print(f"Debug mode: {'ON' if debug_mode else 'OFF'}")
-            elif key == ord('s') and best_pts is not None:  # Save current detection
+            elif key == ord('s') and (best_pts is not None or best_outside_pts is not None):  # Save current detection
                 timestamp = cv2.getTickCount()
                 debug_filename = f"debug_detection_{timestamp}.jpg"
                 cv2.imwrite(debug_filename, display_frame)
                 print(f"Saved debug image: {debug_filename}")
-                if best_score >= MATCH_THRESHOLD:
-                    # Also save the detected region
-                    x, y, w, h = cv2.boundingRect(best_pts)
-                    detected_region = frame_resized[y:y+h, x:x+w]
-                    region_filename = f"debug_detected_region_{timestamp}.jpg"
-                    cv2.imwrite(region_filename, detected_region)
-                    print(f"Saved detected region: {region_filename}")
+                
+                # Save detected regions if they meet threshold
+                if best_pts is not None and best_score >= MATCH_THRESHOLD:
+                    # Use bbox_pts for consistent region extraction
+                    if best_bbox_pts is not None:
+                        x, y, w, h = cv2.boundingRect(best_bbox_pts)
+                        detected_region = frame_resized[y:y+h, x:x+w]
+                        region_filename = f"debug_detected_inside_{timestamp}.jpg"
+                        cv2.imwrite(region_filename, detected_region)
+                        print(f"Saved detected inside region: {region_filename}")
+                
+                if best_outside_pts is not None and best_outside_score >= MATCH_THRESHOLD:
+                    # Use bbox_pts for consistent region extraction
+                    if best_outside_bbox_pts is not None:
+                        x, y, w, h = cv2.boundingRect(best_outside_bbox_pts)
+                        detected_region = frame_resized[y:y+h, x:x+w]
+                        region_filename = f"debug_detected_outside_{timestamp}.jpg"
+                        cv2.imwrite(region_filename, detected_region)
+                        print(f"Saved detected outside region: {region_filename}")
 
     grab_result.Release()
 
