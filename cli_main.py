@@ -19,6 +19,21 @@ import time
 from pypylon import pylon
 import cv2
 import numpy as np
+
+# Clipping calculation functions (from ae_hud)
+def calculate_clipping(gray_frame):
+    """Calculate clipping percentage - pixels that are pure black (0-1) or pure white (254-255)"""
+    hist = cv2.calcHist([gray_frame], [0], None, [256], [0, 256]).ravel()
+    total = gray_frame.size
+    clip = float(hist[:2].sum() + hist[254:].sum()) / total
+    return clip
+
+def exposure_analysis(gray_frame):
+    """Calculate exposure metrics: mean brightness, contrast (std), and clipping"""
+    mean = float(np.mean(gray_frame))
+    std = float(np.std(gray_frame))
+    clip = calculate_clipping(gray_frame)
+    return mean, std, clip
 from flask import Flask, Response, render_template_string
 import logging
 
@@ -58,6 +73,38 @@ reference_region_size = None  # Store reference region size for zoom guidance
 master_image = None  # Store master reference image from setup
 current_metrics = None  # Store current frame metrics
 master_metrics = None  # Store master image metrics
+
+def check_all_metrics_good():
+    """Check if all image quality metrics are in good status (green)"""
+    global master_metrics, current_metrics
+    
+    if master_metrics is None or current_metrics is None:
+        return False
+    
+    try:
+        # Check clipping
+        current_clip_percent = current_metrics['clip'] * 100
+        if current_clip_percent >= 10.0:  # Not good if >= 10%
+            return False
+        
+        # Check brightness
+        mean_diff = current_metrics['mean'] - master_metrics['mean']
+        if abs(mean_diff) >= 10:  # Not good if >= 10
+            return False
+        
+        # Check contrast
+        std_pct = 100.0 * (current_metrics['std'] / master_metrics['std'] - 1.0) if master_metrics['std'] > 1e-9 else 0
+        if std_pct <= -10:  # Not good if <= -10%
+            return False
+        
+        # Check saturation
+        sat_pct = 100.0 * (current_metrics['saturation'] / master_metrics['saturation'] - 1.0) if master_metrics['saturation'] > 1e-9 else 0
+        if abs(sat_pct) >= 15:  # Not good if >= 15%
+            return False
+        
+        return True  # All metrics are good
+    except:
+        return False
 
 def mouse_callback(event, x, y, flags, param):
     """Mouse callback for point selection in OpenCV mode"""
@@ -213,13 +260,17 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
     if master_metrics is not None and ae_hud is not None:
         try:
             metrics = ae_hud.ImageMetrics()
+            # Convert to grayscale for clipping calculation
+            gray_frame_for_clip = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
             current_metrics = {
-                'brightness': metrics.calculate_brightness(frame_resized),
-                'contrast': metrics.calculate_contrast(frame_resized),
-                'sharpness': metrics.calculate_sharpness(frame_resized),
-                'saturation': metrics.calculate_saturation(frame_resized)
+                'mean': metrics.calculate_brightness(frame_resized),
+                'std': metrics.calculate_contrast(frame_resized),
+                'saturation': metrics.calculate_saturation(frame_resized),
+                'clip': calculate_clipping(gray_frame_for_clip),
+                'image': frame_resized
             }
         except Exception as e:
+            print(f"Error calculating current metrics: {e}")
             current_metrics = None
     
     # Detection logic (similar to main.py but optimized for streaming)
@@ -396,7 +447,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                     cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                                    (region_center_x, region_center_y), (0, 255, 0), 2, tipLength=0.2)
                     cv2.putText(display_frame, "Move the object to the target", 
-                               (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                               (10, display_frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                        
     elif best_pts is not None and best_bbox_pts is not None:
         # Low confidence detection - show guidance arrow only
@@ -434,7 +485,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                         instruction += "DOWN"
                 
                 if instruction and instruction != "Move camera ":
-                    cv2.putText(display_frame, instruction.strip(), (10, display_frame.shape[0] - 30),
+                    cv2.putText(display_frame, instruction.strip(), (10, display_frame.shape[0] - 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     
     # Outside region detections - simplified
@@ -456,7 +507,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             
             # For high confidence outside detection, instruct to move the object
             cv2.putText(display_frame, "Move the object into the region", 
-                       (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                       (10, display_frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                        
     elif best_outside_pts is not None and best_outside_bbox_pts is not None:
         # Low confidence outside detection
@@ -490,26 +541,39 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                 move_instruction += "DOWN"
             move_instruction += " to align"
             
-            cv2.putText(display_frame, move_instruction, (10, display_frame.shape[0] - 30),
+            cv2.putText(display_frame, move_instruction, (10, display_frame.shape[0] - 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     
     # Check if reference object is detected with high confidence inside the region
     if (best_score >= MATCH_THRESHOLD and best_pts is not None):
-        cv2.putText(display_frame, "Aligned!", (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        # Check if all metrics are also good
+        all_metrics_good = check_all_metrics_good()
+        
+        if all_metrics_good:
+            # Everything is perfect - show big green success message at the bottom right
+            cv2.putText(display_frame, "Perfect!", (display_frame.shape[1] - 150, display_frame.shape[0] - 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+            cv2.putText(display_frame, "Aligned + Quality OK", (display_frame.shape[1] - 200, display_frame.shape[0] - 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        else:
+            # Object aligned but metrics need attention
+            cv2.putText(display_frame, "Aligned!", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            cv2.putText(display_frame, "Check image quality metrics", (10, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
     
     # Show zoom instruction when no object is detected but we have setup data
     elif (reference_region_size is not None and len(selected_points) == 4 and 
           best_pts is None and best_outside_pts is None):
         # Simple message for no detection
-        cv2.putText(display_frame, "NO OBJECT DETECTED", (10, display_frame.shape[0] - 30),
+        cv2.putText(display_frame, "NO OBJECT DETECTED", (10, display_frame.shape[0] - 90),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
     
     # Show simple message for poor detection quality
-    elif (best_pts is not None and best_score < MATCH_THRESHOLD * 0.5) or \
-         (best_outside_pts is not None and best_outside_score < MATCH_THRESHOLD * 0.5):
-        cv2.putText(display_frame, "POOR DETECTION QUALITY", (10, display_frame.shape[0] - 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+    # elif (best_pts is not None and best_score < MATCH_THRESHOLD * 0.5) or \
+    #      (best_outside_pts is not None and best_outside_score < MATCH_THRESHOLD * 0.5):
+    #     cv2.putText(display_frame, "POOR DETECTION QUALITY", (10, display_frame.shape[0] - 30),
+    #                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
     
     # Clean overlay panel in top-right corner
     overlay_x = display_frame.shape[1] - 250
@@ -1337,22 +1401,80 @@ def get_metrics():
             'message': 'Complete setup to enable metrics monitoring'
         }
     
-    # Calculate percentage differences
-    metrics_comparison = {}
-    for key in master_metrics.keys():
-        if key in current_metrics and master_metrics[key] > 0:
-            difference = ((current_metrics[key] - master_metrics[key]) / master_metrics[key]) * 100
-            metrics_comparison[key] = {
-                'master': round(master_metrics[key], 2),
-                'current': round(current_metrics[key], 2),
-                'difference_percent': round(difference, 1),
-                'status': 'good' if abs(difference) < 10 else 'warning' if abs(difference) < 25 else 'poor'
-            }
-    
-    return {
-        'available': True,
-        'metrics': metrics_comparison
-    }
+    try:
+        # Calculate differences manually since we're using ImageMetrics structure
+        metrics_comparison = {}
+        
+        # Clipping (primary focus)
+        clip_diff = (current_metrics['clip'] - master_metrics['clip']) * 100.0  # Convert to percentage points
+        current_clip_percent = current_metrics['clip'] * 100  # Current clipping as percentage
+        
+        # Status based on absolute clipping percentage (not difference)
+        if current_clip_percent < 10.0:
+            clip_status = 'good'
+        elif current_clip_percent < 20.0:
+            clip_status = 'warning'  # Yellow for 10-20%
+        else:
+            clip_status = 'poor'     # Red for >20%
+        
+        metrics_comparison['clipping'] = {
+            'master': round(master_metrics['clip'] * 100, 2),
+            'current': round(current_clip_percent, 2),
+            'difference_percent': round(clip_diff, 2),
+            'status': clip_status
+        }
+        
+        # Brightness
+        mean_diff = current_metrics['mean'] - master_metrics['mean']
+        metrics_comparison['brightness'] = {
+            'master': round(master_metrics['mean'], 2),
+            'current': round(current_metrics['mean'], 2),
+            'difference_percent': round(mean_diff, 1),
+            'status': 'good' if abs(mean_diff) < 10 else 'warning' if abs(mean_diff) < 25 else 'poor'
+        }
+        
+        # Contrast
+        std_pct = 100.0 * (current_metrics['std'] / master_metrics['std'] - 1.0) if master_metrics['std'] > 1e-9 else 0
+        metrics_comparison['contrast'] = {
+            'master': round(master_metrics['std'], 2),
+            'current': round(current_metrics['std'], 2),
+            'difference_percent': round(std_pct, 1),
+            'status': 'good' if std_pct > -10 else 'warning' if std_pct > -20 else 'poor'
+        }
+        
+        # Saturation
+        sat_pct = 100.0 * (current_metrics['saturation'] / master_metrics['saturation'] - 1.0) if master_metrics['saturation'] > 1e-9 else 0
+        metrics_comparison['saturation'] = {
+            'master': round(master_metrics['saturation'], 2),
+            'current': round(current_metrics['saturation'], 2),
+            'difference_percent': round(sat_pct, 1),
+            'status': 'good' if abs(sat_pct) < 15 else 'warning' if abs(sat_pct) < 30 else 'poor'
+        }
+        
+        # Generate suggestions
+        suggestions = []
+        if current_clip_percent > 10.0:
+            suggestions.append("Reduce exposure to avoid clipping")
+        if abs(mean_diff) > 15:
+            if mean_diff < -15:
+                suggestions.append("Increase brightness/exposure")
+            elif mean_diff > 15:
+                suggestions.append("Decrease brightness/exposure")
+        if abs(sat_pct) > 25:
+            suggestions.append("Check white balance/color settings")
+        
+        return {
+            'available': True,
+            'metrics': metrics_comparison,
+            'suggestion': " | ".join(suggestions) if suggestions else "—"
+        }
+        
+    except Exception as e:
+        print(f"Error in metrics calculation: {e}")
+        return {
+            'available': False,
+            'message': f'Error calculating metrics: {e}'
+        }
 
 @app.route('/click_point', methods=['POST'])
 def click_point():
@@ -1377,16 +1499,21 @@ def confirm_setup():
         
         # Capture current frame as master reference image
         if current_frame is not None:
-            master_image = current_frame.copy()
+            # Resize master image to match processing resolution (640x480) for consistent metrics
+            master_image = cv2.resize(current_frame.copy(), (640, 480))
             # Calculate master image metrics using ae_hud module
             if ae_hud is not None:
                 try:
+                    # Use the ImageMetrics class structure
                     metrics = ae_hud.ImageMetrics()
+                    # Convert to grayscale for clipping calculation
+                    gray_master = cv2.cvtColor(master_image, cv2.COLOR_BGR2GRAY)
                     master_metrics = {
-                        'brightness': metrics.calculate_brightness(master_image),
-                        'contrast': metrics.calculate_contrast(master_image),
-                        'sharpness': metrics.calculate_sharpness(master_image),
-                        'saturation': metrics.calculate_saturation(master_image)
+                        'mean': metrics.calculate_brightness(master_image),
+                        'std': metrics.calculate_contrast(master_image),
+                        'saturation': metrics.calculate_saturation(master_image),
+                        'clip': calculate_clipping(gray_master),
+                        'image': master_image
                     }
                     print(f"Master metrics captured: {master_metrics}")
                 except Exception as e:
