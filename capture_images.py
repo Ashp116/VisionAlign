@@ -62,7 +62,7 @@ def main():
                 elif key == ord('m'):
                     save_jpeg(os.path.join(args.save_dir, "master.jpg"), frame_resized, args.jpeg_quality)
                 elif key == ord('c'):
-                    fname = f"current_{timestamp()}.jpg"
+                    fname = f"example_{timestamp()}.jpg"
                     save_jpeg(os.path.join(args.save_dir, fname), frame_resized, args.jpeg_quality)
 
             grab.Release()
