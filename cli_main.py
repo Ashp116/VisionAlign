@@ -110,7 +110,7 @@ def mouse_callback(event, x, y, flags, param):
     """Mouse callback for point selection in OpenCV mode"""
     global selected_points, setup_complete
     
-    if event == cv2.EVENT_LBUTTONDOWN and len(selected_points) < 4:
+    if event == cv2.EVENT_LBUTTONDOWN and len(seleted_points) < 4:
         selected_points.append((x, y))
         print(f"Point {len(selected_points)} selected: ({x}, {y})")
         
@@ -293,7 +293,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
 
     contours, hierarchy = cv2.findContours(edges_combined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Reset detection variables for this frame
+    # Update detection variables for this frame
     current_best_score = -1
     current_best_pts = None
     current_best_outside_score = -1
@@ -302,6 +302,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
     current_best_outside_bbox_pts = None
     all_candidates = []
     outside_candidates = []
+    current_size_ratio = 0  # Add this line to track size ratio
 
     for cnt in contours:
         # Try different approximation levels
@@ -314,6 +315,12 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                 x, y, w, h = cv2.boundingRect(pts)
                 if w < 12 or h < 12:
                     continue
+                
+                # Calculate size ratio compared to reference
+                if ref_w > 0 and ref_h > 0:
+                    detected_area = w * h
+                    ref_area = ref_w * ref_h
+                    size_ratio = detected_area / ref_area
                 
                 # Shape validation
                 contour_area = cv2.contourArea(approx)
@@ -350,6 +357,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                                 current_best_score = score
                                 current_best_pts = pts
                                 current_best_bbox_pts = bbox_pts
+                                current_size_ratio = size_ratio  # Update size ratio for best match
                         elif len(selected_points) == 4:
                             # Outside region
                             MIN_OUTSIDE_SIZE_FOR_LOW_CONFIDENCE = 100
@@ -644,6 +652,36 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
         cv2.putText(display_frame, f"Setup: {len(selected_points)}/4 points", 
                    (overlay_x + 5, text_y), font, font_scale, (255, 255, 0), 1)
     
+    # Add zoom guidance to the overlay panel
+    text_y += 20
+    if len(selected_points) == 4 and best_bbox_pts is not None:
+        # Calculate area of search region
+        region_pts = np.array(selected_points, dtype=np.int32)
+        region_area = cv2.contourArea(region_pts)
+        
+        # Calculate area of detected box
+        detected_area = cv2.contourArea(best_bbox_pts)
+        
+        if region_area > 0:
+            size_ratio = detected_area / region_area
+            ZOOM_TOLERANCE = 0.15  # 15% tolerance range
+            
+            if size_ratio < (1.0 - ZOOM_TOLERANCE):
+                cv2.putText(display_frame, "➡ MOVE CLOSER", 
+                           (overlay_x + 5, text_y), font, font_scale, (0, 255, 255), 1)
+                cv2.putText(display_frame, f"(Size: {size_ratio:.1f}x)", 
+                           (overlay_x + 130, text_y), font, font_scale * 0.8, (0, 255, 255), 1)
+            elif size_ratio > (1.0 + ZOOM_TOLERANCE):
+                cv2.putText(display_frame, "⬅ MOVE BACK", 
+                           (overlay_x + 5, text_y), font, font_scale, (0, 255, 255), 1)
+                cv2.putText(display_frame, f"(Size: {size_ratio:.1f}x)", 
+                           (overlay_x + 130, text_y), font, font_scale * 0.8, (0, 255, 255), 1)
+            else:
+                cv2.putText(display_frame, "✓ ZOOM OK", 
+                           (overlay_x + 5, text_y), font, font_scale, (0, 255, 0), 1)
+                cv2.putText(display_frame, f"(Size: {size_ratio:.1f}x)", 
+                           (overlay_x + 130, text_y), font, font_scale * 0.8, (0, 255, 0), 1)
+
     return display_frame
 
 def initialize_camera():
