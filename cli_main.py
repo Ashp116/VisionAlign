@@ -335,8 +335,22 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             bbox_center_x += cv2.boundingRect(best_bbox_pts)[2] // 2
             bbox_center_y += cv2.boundingRect(best_bbox_pts)[3] // 2
             cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (0, 255, 0), 2)
-            cv2.putText(display_frame, "✓", (bbox_center_x - 5, bbox_center_y + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(display_frame, "OK", (bbox_center_x - 8, bbox_center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 2)
+            
+            # For high confidence detection, check if object needs to move to target
+            if len(selected_points) == 4:
+                region_center_x = sum(p[0] for p in selected_points) // 4
+                region_center_y = sum(p[1] for p in selected_points) // 4
+                dx = region_center_x - bbox_center_x
+                dy = region_center_y - bbox_center_y
+                distance = np.sqrt(dx*dx + dy*dy)
+                
+                if distance > 40:  # If object is not at target center
+                    cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
+                                   (region_center_x, region_center_y), (0, 255, 0), 2, tipLength=0.2)
+                    cv2.putText(display_frame, "Move the object to the target", 
+                               (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                        
     elif best_pts is not None and best_bbox_pts is not None:
         # Low confidence detection - show guidance arrow only
@@ -355,8 +369,22 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                 cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                                (region_center_x, region_center_y), (255, 255, 0), 3, tipLength=0.2)
                 cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 255, 0), 2)
-                cv2.putText(display_frame, "⚠", (bbox_center_x - 8, bbox_center_y + 6),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(display_frame, "ALIGN", (bbox_center_x - 15, bbox_center_y + 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 2)
+                
+                # For low confidence detection, instruct to move camera
+                instruction = "Move camera "
+                if dx > 20:
+                    instruction += "LEFT "
+                elif dx < -20:
+                    instruction += "RIGHT "
+                if dy > 20:
+                    instruction += "UP"
+                elif dy < -20:
+                    instruction += "DOWN"
+                if instruction != "Move camera ":
+                    cv2.putText(display_frame, instruction.strip(), (10, display_frame.shape[0] - 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     
     # Outside region detections - simplified
     if best_outside_pts is not None and best_outside_score >= MATCH_THRESHOLD:
@@ -372,8 +400,12 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                            (region_center_x, region_center_y), (255, 0, 255), 2, tipLength=0.2)
             cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 0, 255), 2)
-            cv2.putText(display_frame, "!", (bbox_center_x - 4, bbox_center_y + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            cv2.putText(display_frame, "OUT", (bbox_center_x - 12, bbox_center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 2)
+            
+            # For high confidence outside detection, instruct to move the object
+            cv2.putText(display_frame, "Move the object into the region", 
+                       (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                        
     elif best_outside_pts is not None and best_outside_bbox_pts is not None:
         # Low confidence outside detection
@@ -389,8 +421,31 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                            (region_center_x, region_center_y), (255, 0, 255), 3, tipLength=0.2)
             cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 0, 255), 2)
-            cv2.putText(display_frame, "?", (bbox_center_x - 6, bbox_center_y + 6),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            cv2.putText(display_frame, "LOW", (bbox_center_x - 12, bbox_center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 2)
+            
+            # Calculate movement direction for outside object
+            dx_out = bbox_center_x - region_center_x
+            dy_out = bbox_center_y - region_center_y
+            
+            move_instruction = "Move camera "
+            if dx_out > 20:
+                move_instruction += "LEFT "
+            elif dx_out < -20:
+                move_instruction += "RIGHT "
+            if dy_out > 20:
+                move_instruction += "UP"
+            elif dy_out < -20:
+                move_instruction += "DOWN"
+            move_instruction += " to align"
+            
+            cv2.putText(display_frame, move_instruction, (10, display_frame.shape[0] - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    # Check if reference object is detected with high confidence inside the region
+    if (best_score >= MATCH_THRESHOLD and best_pts is not None):
+        cv2.putText(display_frame, "Aligned!", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
     
     # Clean overlay panel in top-right corner
     overlay_x = display_frame.shape[1] - 250
@@ -412,13 +467,13 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
     
     # Show scores in overlay
     if best_score > 0:
-        status = "✓ DETECTED" if best_score >= MATCH_THRESHOLD else "⚠ ALIGNING"
+        status = "DETECTED" if best_score >= MATCH_THRESHOLD else "ALIGNING"
         cv2.putText(display_frame, f"IN: {status} ({best_score:.2f})", 
                    (overlay_x + 5, text_y), font, font_scale, (0, 255, 0), 1)
         text_y += 20
         
     if best_outside_score > 0:
-        status = "✓ OUTSIDE" if best_outside_score >= MATCH_THRESHOLD else "⚠ OUTSIDE"
+        status = "OUTSIDE" if best_outside_score >= MATCH_THRESHOLD else "OUT-LOW"
         color = (255, 0, 255) if best_outside_score >= MATCH_THRESHOLD else (128, 0, 128)
         cv2.putText(display_frame, f"OUT: {status} ({best_outside_score:.2f})", 
                    (overlay_x + 5, text_y), font, font_scale, color, 1)
@@ -632,112 +687,175 @@ HTML_TEMPLATE = '''
         
         body, html {
             height: 100vh;
-            font-family: Arial, sans-serif;
-            background: #f5f5f5;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f8f9fa;
             overflow: hidden;
         }
         
         .container {
             display: flex;
             height: 100vh;
+            gap: 10px;
+            padding: 10px;
         }
         
         .video-section {
             flex: 1;
-            padding: 20px;
             display: flex;
             align-items: center;
             justify-content: center;
+            background: white;
+            border-radius: 8px;
+            padding: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e6e6e6;
         }
         
         .video-container {
-            max-width: 100%;
-            max-height: 100%;
+            position: relative;
+            border-radius: 4px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            background: #000;
+            border: 2px solid #003478;
         }
         
         .video-feed {
-            width: 100%;
-            height: auto;
-            max-height: calc(100vh - 40px);
-            border: 2px solid #333;
             cursor: crosshair;
             display: block;
+            width: 960px;
+            height: 720px;
         }
         
         .controls-panel {
-            width: 250px;
+            width: 280px;
             background: white;
-            border-left: 1px solid #ddd;
+            border-radius: 8px;
             padding: 20px;
             display: flex;
             flex-direction: column;
             gap: 15px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e6e6e6;
         }
         
         .btn {
-            padding: 12px 16px;
-            border: 1px solid #ccc;
-            background: white;
+            padding: 14px 20px;
+            border: 2px solid #003478;
+            background: #003478;
+            color: white;
             cursor: pointer;
             font-size: 14px;
+            font-weight: 600;
             border-radius: 4px;
-            transition: background-color 0.2s;
+            transition: all 0.2s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         
         .btn:hover {
-            background: #f0f0f0;
+            background: #004599;
+            border-color: #004599;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0, 52, 120, 0.3);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+            transition: transform 0.1s;
         }
         
         .btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
-            background: #f9f9f9;
+            transform: none;
+            background: #6c757d;
+            border-color: #6c757d;
+        }
+        
+        .btn:disabled:hover {
+            transform: none;
+            box-shadow: none;
+            background: #6c757d;
+            border-color: #6c757d;
         }
         
         .btn-primary {
-            background: #007bff;
-            color: white;
-            border-color: #007bff;
+            background: #0066cc;
+            border-color: #0066cc;
         }
         
-        .btn-primary:hover:not(:disabled) {
-            background: #0056b3;
+        .btn-primary:hover {
+            background: #0052a3;
+            border-color: #0052a3;
         }
         
         .btn-danger {
             background: #dc3545;
-            color: white;
             border-color: #dc3545;
         }
         
         .btn-danger:hover {
             background: #c82333;
+            border-color: #c82333;
+        }
+        
+        .btn-secondary {
+            background: white;
+            color: #003478;
+            border-color: #003478;
+        }
+        
+        .btn-secondary:hover {
+            background: #003478;
+            color: white;
         }
         
         .threshold-group {
-            display: flex;
-            gap: 5px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
         }
         
         .threshold-group .btn {
-            flex: 1;
-            padding: 8px;
-            font-size: 12px;
+            padding: 12px 16px;
+            font-size: 18px;
+            font-weight: 700;
+            background: white;
+            color: #003478;
+            border-color: #003478;
+        }
+        
+        .threshold-group .btn:hover {
+            background: #003478;
+            color: white;
         }
         
         .separator {
             height: 1px;
-            background: #ddd;
-            margin: 10px 0;
+            background: #dee2e6;
+            margin: 15px 0;
         }
         
         .points-info {
-            font-size: 12px;
-            color: #666;
+            font-size: 14px;
+            font-weight: 600;
+            color: #003478;
             text-align: center;
-            padding: 8px;
+            padding: 16px;
             background: #f8f9fa;
             border-radius: 4px;
+            border: 1px solid #dee2e6;
+        }
+        
+        .control-label {
+            font-size: 11px;
+            color: #6c757d;
+            text-align: center;
+            margin-top: 8px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
     </style>
 </head>
@@ -751,6 +869,7 @@ HTML_TEMPLATE = '''
         
         <div class="controls-panel">
             <div class="points-info" id="points-info">
+                <div style="font-size: 16px; margin-bottom: 5px;">Region Setup</div>
                 Points: <span id="points-count">{{ points_count }}</span>/4
             </div>
             
@@ -758,7 +877,7 @@ HTML_TEMPLATE = '''
             <button class="btn btn-primary" id="confirm-btn" onclick="confirmSetup()" {% if points_count < 4 %}disabled{% endif %}>
                 Confirm Setup
             </button>
-            <button class="btn" onclick="resetPoints()">Reset Points</button>
+            <button class="btn btn-secondary" onclick="resetPoints()">Reset Points</button>
             {% else %}
             <button class="btn btn-danger" onclick="resetSetup()">Reset Setup</button>
             {% endif %}
@@ -767,9 +886,9 @@ HTML_TEMPLATE = '''
             
             <div class="threshold-group">
                 <button class="btn" onclick="increaseThreshold()">+</button>
-                <button class="btn" onclick="decreaseThreshold()">-</button>
+                <button class="btn" onclick="decreaseThreshold()">−</button>
             </div>
-            <div style="text-align: center; font-size: 11px; color: #666;">Threshold</div>
+            <div class="control-label">Detection Threshold</div>
         </div>
     </div>
 
