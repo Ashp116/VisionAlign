@@ -22,6 +22,13 @@ import numpy as np
 from flask import Flask, Response, render_template_string
 import logging
 
+# Import auto exposure module
+try:
+    import ae_hud
+except ImportError:
+    print("Warning: ae_hud module not found. Auto exposure features will be disabled.")
+    ae_hud = None
+
 # Suppress Flask's default logging to keep console clean
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -43,6 +50,14 @@ frame_lock = threading.Lock()
 camera = None
 streaming_active = False
 global_threshold = 0.15
+auto_exposure_enabled = False
+auto_exposure_controller = None
+reference_exposure = None  # Store the setup exposure as reference
+auto_exposure_available = False  # Only becomes True after setup
+reference_region_size = None  # Store reference region size for zoom guidance
+master_image = None  # Store master reference image from setup
+current_metrics = None  # Store current frame metrics
+master_metrics = None  # Store master image metrics
 
 def mouse_callback(event, x, y, flags, param):
     """Mouse callback for point selection in OpenCV mode"""
@@ -189,10 +204,23 @@ def is_rect_in_polygon(rect_points, polygon_points, margin_percent=5):
 def process_frame(frame, MATCH_THRESHOLD=0.15):
     """Process a single frame and return the processed frame with detections"""
     global best_pts, best_score, best_outside_pts, best_outside_score
-    global best_bbox_pts, best_outside_bbox_pts
+    global best_bbox_pts, best_outside_bbox_pts, current_metrics
     
     frame_resized = cv2.resize(frame, (640, 480))
     gray_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate current frame metrics if master metrics exist
+    if master_metrics is not None and ae_hud is not None:
+        try:
+            metrics = ae_hud.ImageMetrics()
+            current_metrics = {
+                'brightness': metrics.calculate_brightness(frame_resized),
+                'contrast': metrics.calculate_contrast(frame_resized),
+                'sharpness': metrics.calculate_sharpness(frame_resized),
+                'saturation': metrics.calculate_saturation(frame_resized)
+            }
+        except Exception as e:
+            current_metrics = None
     
     # Detection logic (similar to main.py but optimized for streaming)
     DETECTION_SKIP = 2
@@ -310,6 +338,24 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
     best_bbox_pts = current_best_bbox_pts
     best_outside_bbox_pts = current_best_outside_bbox_pts
     
+    # Calculate zoom guidance based on object size vs reference region size
+    zoom_instruction = None
+    if reference_region_size is not None and best_bbox_pts is not None and best_score < MATCH_THRESHOLD:
+        ref_width, ref_height = reference_region_size
+        obj_bbox = cv2.boundingRect(best_bbox_pts)
+        obj_width, obj_height = obj_bbox[2], obj_bbox[3]
+        
+        # Calculate size ratios
+        width_ratio = obj_width / ref_width if ref_width > 0 else 1.0
+        height_ratio = obj_height / ref_height if ref_height > 0 else 1.0
+        avg_ratio = (width_ratio + height_ratio) / 2.0
+        
+        # Determine zoom instruction based on size difference (threshold: 30% difference)
+        if avg_ratio < 0.7:  # Object significantly smaller than reference
+            zoom_instruction = "ZOOM IN - Object too small"
+        elif avg_ratio > 1.3:  # Object significantly larger than reference
+            zoom_instruction = "ZOOM OUT - Object too large"
+        
     # Draw detection results
     display_frame = frame_resized.copy()
     
@@ -343,8 +389,22 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             bbox_center_x += cv2.boundingRect(best_bbox_pts)[2] // 2
             bbox_center_y += cv2.boundingRect(best_bbox_pts)[3] // 2
             cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (0, 255, 0), 2)
-            cv2.putText(display_frame, "✓", (bbox_center_x - 5, bbox_center_y + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(display_frame, "OK", (bbox_center_x - 8, bbox_center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 2)
+            
+            # For high confidence detection, check if object needs to move to target
+            if len(selected_points) == 4:
+                region_center_x = sum(p[0] for p in selected_points) // 4
+                region_center_y = sum(p[1] for p in selected_points) // 4
+                dx = region_center_x - bbox_center_x
+                dy = region_center_y - bbox_center_y
+                distance = np.sqrt(dx*dx + dy*dy)
+                
+                if distance > 40:  # If object is not at target center
+                    cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
+                                   (region_center_x, region_center_y), (0, 255, 0), 2, tipLength=0.2)
+                    cv2.putText(display_frame, "Move the object to the target", 
+                               (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                        
     elif best_pts is not None and best_bbox_pts is not None:
         # Low confidence detection - show guidance arrow only
@@ -363,8 +423,27 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                 cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                                (region_center_x, region_center_y), (255, 255, 0), 3, tipLength=0.2)
                 cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 255, 0), 2)
-                cv2.putText(display_frame, "⚠", (bbox_center_x - 8, bbox_center_y + 6),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(display_frame, "ALIGN", (bbox_center_x - 15, bbox_center_y + 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 2)
+                
+                # For low confidence detection, instruct to move camera or zoom
+                instruction = ""
+                if zoom_instruction:
+                    instruction = zoom_instruction
+                else:
+                    instruction = "Move camera "
+                    if dx > 20:
+                        instruction += "LEFT "
+                    elif dx < -20:
+                        instruction += "RIGHT "
+                    if dy > 20:
+                        instruction += "UP"
+                    elif dy < -20:
+                        instruction += "DOWN"
+                
+                if instruction and instruction != "Move camera ":
+                    cv2.putText(display_frame, instruction.strip(), (10, display_frame.shape[0] - 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     
     # Outside region detections - simplified
     if best_outside_pts is not None and best_outside_score >= MATCH_THRESHOLD:
@@ -380,8 +459,12 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                            (region_center_x, region_center_y), (255, 0, 255), 2, tipLength=0.2)
             cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 0, 255), 2)
-            cv2.putText(display_frame, "!", (bbox_center_x - 4, bbox_center_y + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            cv2.putText(display_frame, "OUT", (bbox_center_x - 12, bbox_center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 2)
+            
+            # For high confidence outside detection, instruct to move the object
+            cv2.putText(display_frame, "Move the object into the region", 
+                       (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                        
     elif best_outside_pts is not None and best_outside_bbox_pts is not None:
         # Low confidence outside detection
@@ -397,13 +480,49 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
             cv2.arrowedLine(display_frame, (bbox_center_x, bbox_center_y), 
                            (region_center_x, region_center_y), (255, 0, 255), 3, tipLength=0.2)
             cv2.circle(display_frame, (bbox_center_x, bbox_center_y), 8, (255, 0, 255), 2)
-            cv2.putText(display_frame, "?", (bbox_center_x - 6, bbox_center_y + 6),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            cv2.putText(display_frame, "LOW", (bbox_center_x - 12, bbox_center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 2)
+            
+            # Calculate movement direction for outside object
+            dx_out = bbox_center_x - region_center_x
+            dy_out = bbox_center_y - region_center_y
+            
+            move_instruction = "Move camera "
+            if dx_out > 20:
+                move_instruction += "LEFT "
+            elif dx_out < -20:
+                move_instruction += "RIGHT "
+            if dy_out > 20:
+                move_instruction += "UP"
+            elif dy_out < -20:
+                move_instruction += "DOWN"
+            move_instruction += " to align"
+            
+            cv2.putText(display_frame, move_instruction, (10, display_frame.shape[0] - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    # Check if reference object is detected with high confidence inside the region
+    if (best_score >= MATCH_THRESHOLD and best_pts is not None):
+        cv2.putText(display_frame, "Aligned!", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    
+    # Show zoom instruction when no object is detected but we have setup data
+    elif (reference_region_size is not None and len(selected_points) == 4 and 
+          best_pts is None and best_outside_pts is None):
+        # Simple message for no detection
+        cv2.putText(display_frame, "NO OBJECT DETECTED", (10, display_frame.shape[0] - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    
+    # Show simple message for poor detection quality
+    elif (best_pts is not None and best_score < MATCH_THRESHOLD * 0.5) or \
+         (best_outside_pts is not None and best_outside_score < MATCH_THRESHOLD * 0.5):
+        cv2.putText(display_frame, "POOR DETECTION QUALITY", (10, display_frame.shape[0] - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
     
     # Clean overlay panel in top-right corner
     overlay_x = display_frame.shape[1] - 250
     overlay_y = 20
-    overlay_height = 120
+    overlay_height = 140  # Increased for quality status
     
     # Create semi-transparent background for overlay
     overlay_bg = display_frame[overlay_y:overlay_y+overlay_height, overlay_x:overlay_x+240].copy()
@@ -420,13 +539,13 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
     
     # Show scores in overlay
     if best_score > 0:
-        status = "✓ DETECTED" if best_score >= MATCH_THRESHOLD else "⚠ ALIGNING"
+        status = "DETECTED" if best_score >= MATCH_THRESHOLD else "ALIGNING"
         cv2.putText(display_frame, f"IN: {status} ({best_score:.2f})", 
                    (overlay_x + 5, text_y), font, font_scale, (0, 255, 0), 1)
         text_y += 20
         
     if best_outside_score > 0:
-        status = "✓ OUTSIDE" if best_outside_score >= MATCH_THRESHOLD else "⚠ OUTSIDE"
+        status = "OUTSIDE" if best_outside_score >= MATCH_THRESHOLD else "OUT-LOW"
         color = (255, 0, 255) if best_outside_score >= MATCH_THRESHOLD else (128, 0, 128)
         cv2.putText(display_frame, f"OUT: {status} ({best_outside_score:.2f})", 
                    (overlay_x + 5, text_y), font, font_scale, color, 1)
@@ -435,6 +554,30 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
     # Show threshold
     cv2.putText(display_frame, f"Threshold: {MATCH_THRESHOLD:.2f}", 
                (overlay_x + 5, text_y), font, font_scale, (255, 255, 255), 1)
+    text_y += 20
+    
+    # Show detection quality status
+    quality_status = "NONE"
+    quality_color = (128, 128, 128)
+    
+    if best_score > 0 or best_outside_score > 0:
+        max_score = max(best_score if best_score > 0 else 0, 
+                       best_outside_score if best_outside_score > 0 else 0)
+        if max_score >= MATCH_THRESHOLD:
+            quality_status = "EXCELLENT"
+            quality_color = (0, 255, 0)
+        elif max_score >= MATCH_THRESHOLD * 0.7:
+            quality_status = "GOOD"
+            quality_color = (255, 255, 0)
+        elif max_score >= MATCH_THRESHOLD * 0.4:
+            quality_status = "POOR" 
+            quality_color = (255, 165, 0)
+        else:
+            quality_status = "VERY POOR"
+            quality_color = (255, 0, 0)
+    
+    cv2.putText(display_frame, f"Quality: {quality_status}", 
+               (overlay_x + 5, text_y), font, font_scale, quality_color, 1)
     text_y += 20
     
     # Show detection status
@@ -479,7 +622,7 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
 
 def initialize_camera():
     """Initialize the Basler camera"""
-    global camera
+    global camera, auto_exposure_controller
     
     tlf = pylon.TlFactory.GetInstance()
     devices = tlf.EnumerateDevices()
@@ -490,6 +633,16 @@ def initialize_camera():
     camera = pylon.InstantCamera(tlf.CreateDevice(devices[0]))
     camera.Open()
     camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    
+    # Initialize auto exposure controller if ae_hud is available
+    if ae_hud:
+        auto_exposure_controller = ae_hud.AutoExposureController(
+            target_brightness=128,
+            adjustment_threshold=15,
+            max_adjustment=500
+        )
+        print("Auto exposure controller initialized")
+    
     return True
 
 def cleanup_camera():
@@ -609,6 +762,13 @@ def camera_capture_thread():
             if grab_result.GrabSucceeded():
                 frame = converter.Convert(grab_result).GetArray()
                 
+                # Apply auto exposure only after setup is complete and when available
+                if auto_exposure_enabled and auto_exposure_available and auto_exposure_controller is not None:
+                    try:
+                        auto_exposure_controller.adjust_exposure(frame, camera)
+                    except Exception as e:
+                        print(f"Auto exposure error: {e}")
+                
                 with frame_lock:
                     if setup_complete:
                         current_frame = process_frame(frame, global_threshold)
@@ -670,112 +830,251 @@ HTML_TEMPLATE = '''
         
         body, html {
             height: 100vh;
-            font-family: Arial, sans-serif;
-            background: #f5f5f5;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f8f9fa;
             overflow: hidden;
         }
         
         .container {
             display: flex;
             height: 100vh;
+            gap: 10px;
+            padding: 10px;
         }
         
         .video-section {
             flex: 1;
-            padding: 20px;
             display: flex;
             align-items: center;
             justify-content: center;
+            background: white;
+            border-radius: 8px;
+            padding: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e6e6e6;
         }
         
         .video-container {
-            max-width: 100%;
-            max-height: 100%;
+            position: relative;
+            border-radius: 4px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            background: #000;
+            border: 2px solid #003478;
         }
         
         .video-feed {
-            width: 100%;
-            height: auto;
-            max-height: calc(100vh - 40px);
-            border: 2px solid #333;
             cursor: crosshair;
             display: block;
+            width: 960px;
+            height: 720px;
         }
         
         .controls-panel {
-            width: 250px;
+            width: 350px;
             background: white;
-            border-left: 1px solid #ddd;
+            border-radius: 8px;
             padding: 20px;
             display: flex;
             flex-direction: column;
             gap: 15px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e6e6e6;
+            overflow-y: auto;
+        }
+        
+        .section-divider {
+            height: 1px;
+            background: #003478;
+            margin: 20px 0;
+            position: relative;
+        }
+        
+        .section-divider::after {
+            content: '';
+            position: absolute;
+            top: -2px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 30px;
+            height: 5px;
+            background: #003478;
+            border-radius: 2px;
+        }
+        
+        .metric-item {
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 12px;
+            border-left: 4px solid #003478;
+        }
+        
+        .metric-name {
+            font-weight: 600;
+            color: #003478;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+        
+        .metric-values {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+        }
+        
+        .metric-change {
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+        
+        .metric-change.good {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .metric-change.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .metric-change.poor {
+            background: #f8d7da;
+            color: #721c24;
         }
         
         .btn {
-            padding: 12px 16px;
-            border: 1px solid #ccc;
-            background: white;
+            padding: 14px 20px;
+            border: 2px solid #003478;
+            background: #003478;
+            color: white;
             cursor: pointer;
             font-size: 14px;
+            font-weight: 600;
             border-radius: 4px;
-            transition: background-color 0.2s;
+            transition: all 0.2s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         
         .btn:hover {
-            background: #f0f0f0;
+            background: #004599;
+            border-color: #004599;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0, 52, 120, 0.3);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+            transition: transform 0.1s;
         }
         
         .btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
-            background: #f9f9f9;
+            transform: none;
+            background: #6c757d;
+            border-color: #6c757d;
+        }
+        
+        .btn:disabled:hover {
+            transform: none;
+            box-shadow: none;
+            background: #6c757d;
+            border-color: #6c757d;
         }
         
         .btn-primary {
-            background: #007bff;
-            color: white;
-            border-color: #007bff;
+            background: #0066cc;
+            border-color: #0066cc;
         }
         
-        .btn-primary:hover:not(:disabled) {
-            background: #0056b3;
+        .btn-primary:hover {
+            background: #0052a3;
+            border-color: #0052a3;
         }
         
         .btn-danger {
             background: #dc3545;
-            color: white;
             border-color: #dc3545;
         }
         
         .btn-danger:hover {
             background: #c82333;
+            border-color: #c82333;
+        }
+        
+        .btn-secondary {
+            background: white;
+            color: #003478;
+            border-color: #003478;
+        }
+        
+        .btn-secondary:hover {
+            background: #003478;
+            color: white;
         }
         
         .threshold-group {
-            display: flex;
-            gap: 5px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
         }
         
         .threshold-group .btn {
-            flex: 1;
-            padding: 8px;
-            font-size: 12px;
+            padding: 12px 16px;
+            font-size: 18px;
+            font-weight: 700;
+            background: white;
+            color: #003478;
+            border-color: #003478;
+        }
+        
+        .threshold-group .btn:hover {
+            background: #003478;
+            color: white;
         }
         
         .separator {
             height: 1px;
-            background: #ddd;
-            margin: 10px 0;
+            background: #dee2e6;
+            margin: 15px 0;
+        }
+        
+        .btn-secondary {
+            background-color: #555;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background-color: #666;
+        }
+        
+        .btn-secondary.active {
+            background-color: #003478;
         }
         
         .points-info {
-            font-size: 12px;
-            color: #666;
+            font-size: 14px;
+            font-weight: 600;
+            color: #003478;
             text-align: center;
-            padding: 8px;
+            padding: 16px;
             background: #f8f9fa;
             border-radius: 4px;
+            border: 1px solid #dee2e6;
+        }
+        
+        .control-label {
+            font-size: 11px;
+            color: #6c757d;
+            text-align: center;
+            margin-top: 8px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
     </style>
 </head>
@@ -789,6 +1088,7 @@ HTML_TEMPLATE = '''
         
         <div class="controls-panel">
             <div class="points-info" id="points-info">
+                <div style="font-size: 16px; margin-bottom: 5px;">Region Setup</div>
                 Points: <span id="points-count">{{ points_count }}</span>/4
             </div>
             
@@ -796,7 +1096,7 @@ HTML_TEMPLATE = '''
             <button class="btn btn-primary" id="confirm-btn" onclick="confirmSetup()" {% if points_count < 4 %}disabled{% endif %}>
                 Confirm Setup
             </button>
-            <button class="btn" onclick="resetPoints()">Reset Points</button>
+            <button class="btn btn-secondary" onclick="resetPoints()">Reset Points</button>
             {% else %}
             <button class="btn btn-danger" onclick="resetSetup()">Reset Setup</button>
             {% endif %}
@@ -805,9 +1105,27 @@ HTML_TEMPLATE = '''
             
             <div class="threshold-group">
                 <button class="btn" onclick="increaseThreshold()">+</button>
-                <button class="btn" onclick="decreaseThreshold()">-</button>
+                <button class="btn" onclick="decreaseThreshold()">−</button>
             </div>
-            <div style="text-align: center; font-size: 11px; color: #666;">Threshold</div>
+            <div class="control-label">Detection Threshold</div>
+            
+            <div class="separator"></div>
+            
+            <button class="btn btn-secondary" id="auto-exposure-btn" onclick="toggleAutoExposure()" disabled>
+                Auto Exposure: DISABLED
+            </button>
+            <div class="control-label">Camera Control (Setup Required)</div>
+            
+            <div class="section-divider"></div>
+            
+            <div style="font-size: 18px; font-weight: 600; color: #003478; margin-bottom: 15px;">
+                Image Quality Metrics
+            </div>
+            <div id="metrics-content">
+                <div style="text-align: center; color: #666; padding: 20px;">
+                    Complete setup to enable<br>metrics monitoring
+                </div>
+            </div>
         </div>
     </div>
 
@@ -832,7 +1150,17 @@ HTML_TEMPLATE = '''
         
         function confirmSetup() {
             fetch('/confirm_setup', { method: 'POST' })
-                .then(() => setTimeout(() => location.reload(), 500));
+                .then(() => {
+                    // Update button state after setup confirmation
+                    setTimeout(() => {
+                        const button = document.getElementById('auto-exposure-btn');
+                        const label = button.parentNode.querySelector('.control-label');
+                        button.disabled = false;
+                        button.textContent = 'Auto Exposure: OFF';
+                        label.textContent = 'Camera Control';
+                        location.reload();
+                    }, 100);
+                });
         }
         
         function resetPoints() {
@@ -852,6 +1180,33 @@ HTML_TEMPLATE = '''
         function decreaseThreshold() {
             fetch('/threshold/decrease', { method: 'POST' });
         }
+        
+        function toggleAutoExposure() {
+            fetch('/toggle_auto_exposure', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    const button = document.getElementById('auto-exposure-btn');
+                    if (data.status === 'error') {
+                        alert(data.message + ' - Complete camera setup first');
+                        button.textContent = 'Auto Exposure: DISABLED';
+                        button.disabled = true;
+                        button.classList.remove('active');
+                    } else {
+                        button.textContent = data.auto_exposure_enabled ? 'Auto Exposure: ON' : 'Auto Exposure: OFF';
+                        button.disabled = false;
+                        button.classList.toggle('active', data.auto_exposure_enabled);
+                    }
+                });
+        }
+        
+        // Function to enable auto exposure button after setup
+        function enableAutoExposure() {
+            const button = document.getElementById('auto-exposure-btn');
+            const label = button.parentNode.querySelector('.control-label');
+            button.disabled = false;
+            button.textContent = 'Auto Exposure: OFF';
+            label.textContent = 'Camera Control';
+        }
 
         // Handle clicks on video feed (for point selection)
         document.getElementById('video-feed').addEventListener('click', function(e) {
@@ -865,6 +1220,118 @@ HTML_TEMPLATE = '''
                 body: JSON.stringify({ x: x, y: y })
             });
         });
+        
+        // Update button state based on server status
+        function updateButtonState() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Status data:', data); // Debug log
+                    const button = document.getElementById('auto-exposure-btn');
+                    const label = button.parentNode.querySelector('.control-label');
+                    
+                    if (data.auto_exposure_available) {
+                        console.log('Auto exposure is available, enabling button');
+                        button.disabled = false;
+                        button.textContent = data.auto_exposure_enabled ? 'Auto Exposure: ON' : 'Auto Exposure: OFF';
+                        button.classList.toggle('active', data.auto_exposure_enabled);
+                        label.textContent = 'Camera Control';
+                    } else {
+                        console.log('Auto exposure not available, disabling button');
+                        button.disabled = true;
+                        button.textContent = 'Auto Exposure: DISABLED';
+                        button.classList.remove('active');
+                        label.textContent = 'Camera Control (Setup Required)';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error updating button state:', error);
+                });
+        }
+        
+        // Update button state when page loads
+        updateButtonState();
+        
+        // Update button state every 2 seconds
+        setInterval(updateButtonState, 2000);
+        
+        // Update button state on page load
+        function updateButtonState() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    const button = document.getElementById('auto-exposure-btn');
+                    const label = button.parentNode.querySelector('.control-label');
+                    
+                    if (data.auto_exposure_available) {
+                        button.disabled = false;
+                        button.textContent = data.auto_exposure_enabled ? 'Auto Exposure: ON' : 'Auto Exposure: OFF';
+                        button.classList.toggle('active', data.auto_exposure_enabled);
+                        label.textContent = 'Camera Control';
+                    } else {
+                        button.disabled = true;
+                        button.textContent = 'Auto Exposure: DISABLED';
+                        button.classList.remove('active');
+                        label.textContent = 'Camera Control (Setup Required)';
+                    }
+                });
+        }
+        
+        // Update button state when page loads
+        updateButtonState();
+        
+        // Update button state every 2 seconds
+        setInterval(updateButtonState, 2000);
+        
+        // Update metrics panel
+        function updateMetrics() {
+            fetch('/metrics')
+                .then(response => response.json())
+                .then(data => {
+                    const metricsContent = document.getElementById('metrics-content');
+                    
+                    if (!data.available) {
+                        metricsContent.innerHTML = `
+                            <div style="text-align: center; color: #666; padding: 20px;">
+                                ${data.message || 'Complete setup to enable<br>metrics monitoring'}
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    let html = '';
+                    const metrics = data.metrics;
+                    
+                    Object.keys(metrics).forEach(key => {
+                        const metric = metrics[key];
+                        const displayName = key.charAt(0).toUpperCase() + key.slice(1);
+                        const changeText = metric.difference_percent > 0 ? 
+                            `+${metric.difference_percent}%` : `${metric.difference_percent}%`;
+                        
+                        html += `
+                            <div class="metric-item">
+                                <div class="metric-name">${displayName}</div>
+                                <div class="metric-values">
+                                    <span>Master: ${metric.master}</span>
+                                    <span class="metric-change ${metric.status}">${changeText}</span>
+                                </div>
+                                <div style="font-size: 11px; color: #666; margin-top: 3px;">
+                                    Current: ${metric.current}
+                                </div>
+                            </div>
+                        `;
+                    });
+                    
+                    metricsContent.innerHTML = html;
+                })
+                .catch(error => {
+                    console.error('Error updating metrics:', error);
+                });
+        }
+        
+        // Update metrics every 1 second
+        setInterval(updateMetrics, 1000);
+        updateMetrics(); // Initial load
     </script>
 </body>
 </html>
@@ -888,12 +1355,41 @@ def video_feed():
 
 @app.route('/status')
 def status():
-    """API endpoint for current status"""
+    """Get current status"""
+    global selected_points, setup_complete, auto_exposure_available, auto_exposure_enabled
     return {
-        'points_count': len(selected_points),
+        'points': len(selected_points),
         'setup_complete': setup_complete,
-        'reference_loaded': reference_image_loaded,
-        'points': selected_points
+        'auto_exposure_available': auto_exposure_available,
+        'auto_exposure_enabled': auto_exposure_enabled
+    }
+
+@app.route('/metrics')
+def get_metrics():
+    """Get current image quality metrics compared to master"""
+    global master_metrics, current_metrics
+    
+    if master_metrics is None or current_metrics is None:
+        return {
+            'available': False,
+            'message': 'Complete setup to enable metrics monitoring'
+        }
+    
+    # Calculate percentage differences
+    metrics_comparison = {}
+    for key in master_metrics.keys():
+        if key in current_metrics and master_metrics[key] > 0:
+            difference = ((current_metrics[key] - master_metrics[key]) / master_metrics[key]) * 100
+            metrics_comparison[key] = {
+                'master': round(master_metrics[key], 2),
+                'current': round(current_metrics[key], 2),
+                'difference_percent': round(difference, 1),
+                'status': 'good' if abs(difference) < 10 else 'warning' if abs(difference) < 25 else 'poor'
+            }
+    
+    return {
+        'available': True,
+        'metrics': metrics_comparison
     }
 
 @app.route('/click_point', methods=['POST'])
@@ -912,28 +1408,84 @@ def click_point():
 @app.route('/confirm_setup', methods=['POST'])
 def confirm_setup():
     """Confirm setup and start tracking"""
-    global setup_complete
+    global setup_complete, reference_exposure, camera, auto_exposure_controller, auto_exposure_available, reference_region_size, master_image, master_metrics
     if len(selected_points) == 4:
         setup_complete = True
         extract_reference_region(None, selected_points)
+        
+        # Capture current frame as master reference image
+        if current_frame is not None:
+            master_image = current_frame.copy()
+            # Calculate master image metrics using ae_hud module
+            if ae_hud is not None:
+                try:
+                    metrics = ae_hud.ImageMetrics()
+                    master_metrics = {
+                        'brightness': metrics.calculate_brightness(master_image),
+                        'contrast': metrics.calculate_contrast(master_image),
+                        'sharpness': metrics.calculate_sharpness(master_image),
+                        'saturation': metrics.calculate_saturation(master_image)
+                    }
+                    print(f"Master metrics captured: {master_metrics}")
+                except Exception as e:
+                    print(f"Failed to calculate master metrics: {e}")
+                    master_metrics = None
+        
+        # Calculate reference region size for zoom guidance
+        pts = np.array(selected_points, dtype=np.int32)
+        x, y, w, h = cv2.boundingRect(pts)
+        reference_region_size = (w, h)
+        print(f"Reference region size captured: {w}x{h} pixels")
+        
+        # Capture current exposure as reference for auto exposure
+        if camera is not None:
+            try:
+                reference_exposure = camera.ExposureTime.GetValue()
+                print(f"Reference exposure captured: {reference_exposure:.0f}μs")
+                
+                # Set the target exposure in the auto exposure controller
+                if auto_exposure_controller is not None:
+                    auto_exposure_controller.set_target_exposure(reference_exposure)
+                    
+                # Make auto exposure available now that setup is complete
+                auto_exposure_available = True
+                print("Auto exposure is now available for use")
+                    
+            except Exception as e:
+                print(f"Failed to capture reference exposure: {e}")
+        
         print("Setup confirmed via web interface")
+        print("You can now enable auto exposure to maintain this exposure level")
     return {'status': 'ok'}
 
 @app.route('/reset_points', methods=['POST'])
 def reset_points():
     """Reset selected points"""
-    global selected_points
+    global selected_points, auto_exposure_enabled, auto_exposure_available, reference_region_size, master_image, master_metrics, current_metrics
     selected_points = []
-    print("Points reset via web interface")
+    auto_exposure_enabled = False  # Disable auto exposure
+    auto_exposure_available = False  # Make it unavailable again
+    reference_region_size = None  # Clear reference size
+    master_image = None  # Clear master image
+    master_metrics = None  # Clear master metrics
+    current_metrics = None  # Clear current metrics
+    print("Points reset via web interface - all references cleared")
     return {'status': 'ok'}
 
 @app.route('/reset_setup', methods=['POST'])
 def reset_setup():
     """Reset entire setup"""
-    global selected_points, setup_complete
+    global selected_points, setup_complete, auto_exposure_enabled, auto_exposure_available, reference_exposure, reference_region_size, master_image, master_metrics, current_metrics
     selected_points = []
     setup_complete = False
-    print("Setup reset via web interface")
+    auto_exposure_enabled = False  # Disable auto exposure
+    auto_exposure_available = False  # Make it unavailable again  
+    reference_exposure = None  # Clear reference
+    reference_region_size = None  # Clear reference size
+    master_image = None  # Clear master image
+    master_metrics = None  # Clear master metrics
+    current_metrics = None  # Clear current metrics
+    print("Setup reset via web interface - returning to raw camera view")
     return {'status': 'ok'}
 
 @app.route('/threshold/<action>', methods=['POST'])
@@ -949,6 +1501,26 @@ def adjust_threshold(action):
         print(f"Threshold decreased to: {global_threshold:.2f}")
     
     return {'status': 'ok', 'threshold': global_threshold}
+
+@app.route('/toggle_auto_exposure', methods=['POST'])
+def toggle_auto_exposure():
+    """Toggle auto exposure on/off"""
+    global auto_exposure_enabled, auto_exposure_available, reference_exposure
+    
+    # Only allow auto exposure after setup is complete
+    if not auto_exposure_available:
+        print("Auto exposure not available - complete setup first")
+        return {'status': 'error', 'message': 'Complete setup first', 'auto_exposure_enabled': False}
+    
+    auto_exposure_enabled = not auto_exposure_enabled
+    status = "ON" if auto_exposure_enabled else "OFF"
+    
+    if auto_exposure_enabled and reference_exposure is not None:
+        print(f"Auto exposure toggled {status} - targeting {reference_exposure:.0f}μs")
+    else:
+        print(f"Auto exposure toggled {status}")
+    
+    return {'status': 'ok', 'auto_exposure_enabled': auto_exposure_enabled}
 
 def run_web_mode(port=5000):
     """Run the application in web streaming mode"""
