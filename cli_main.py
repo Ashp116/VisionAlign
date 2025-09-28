@@ -476,13 +476,13 @@ def process_frame(frame, MATCH_THRESHOLD=0.15):
                 else:
                     instruction = "Move camera "
                     if dx > 20:
-                        instruction += "LEFT "
-                    elif dx < -20:
                         instruction += "RIGHT "
+                    elif dx < -20:
+                        instruction += "LEFT "
                     if dy > 20:
-                        instruction += "UP"
-                    elif dy < -20:
                         instruction += "DOWN"
+                    elif dy < -20:
+                        instruction += "UP"
                 
                 if instruction and instruction != "Move camera ":
                     cv2.putText(display_frame, instruction.strip(), (10, display_frame.shape[0] - 60),

@@ -1,0 +1,20 @@
+# AlignVision Requirements
+
+# Core computer vision and image processing
+opencv-python>=4.5.0
+numpy>=1.21.0
+
+# Web streaming interface
+flask>=2.0.0
+
+# Basler camera support
+# pypylon  # Install via: pip install pypylon
+# Note: Requires Basler Pylon Camera Software Suite
+# Download from: https://www.baslerweb.com/en/downloads/software-downloads/
+
+# Optional: For enhanced image processing
+Pillow>=8.0.0
+
+# Development dependencies (optional)
+# pytest>=6.0.0  # For testing
+# black>=21.0.0  # Code formatting
