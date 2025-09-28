@@ -186,11 +186,104 @@ def get_frame_basler(camera, converter):
     grab.Release()
     return None
 
+
+class AutoExposureController:
+    """Simple auto-exposure controller that works with Basler (pypylon) or OpenCV cameras.
+    It monitors a target mean delta and nudges exposure up/down when lighting severity is WARN/CRIT.
+    The controller rate-limits changes and clamps to safe bounds.
+    """
+    def __init__(self, *, camera=None, cap=None, use_basler=False,
+                 min_exposure=-100000.0, max_exposure=100000.0,
+                 step_pct=0.1, min_interval_s=1.0):
+        self.camera = camera
+        self.cap = cap
+        self.use_basler = use_basler
+        self.min_exposure = min_exposure
+        self.max_exposure = max_exposure
+        self.step_pct = step_pct
+        self.min_interval_s = min_interval_s
+        self.last_change = 0.0
+
+    def _get_exposure_basler(self):
+        try:
+            if not self.camera:
+                return None
+            # Many Basler cameras expose ExposureTime or ExposureTimeAbs
+            if hasattr(self.camera, 'ExposureTime'):
+                return float(self.camera.ExposureTime.GetValue())
+            if hasattr(self.camera, 'ExposureTimeAbs'):
+                return float(self.camera.ExposureTimeAbs.GetValue())
+        except Exception:
+            return None
+
+    def _set_exposure_basler(self, val):
+        try:
+            if not self.camera:
+                return False
+            if hasattr(self.camera, 'ExposureTime'):
+                self.camera.ExposureTime.SetValue(int(val))
+                return True
+            if hasattr(self.camera, 'ExposureTimeAbs'):
+                self.camera.ExposureTimeAbs.SetValue(float(val))
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _get_exposure_opencv(self):
+        try:
+            if not self.cap:
+                return None
+            val = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+            return float(val) if val is not None and val != -1 else None
+        except Exception:
+            return None
+
+    def _set_exposure_opencv(self, val):
+        try:
+            if not self.cap:
+                return False
+            return self.cap.set(cv2.CAP_PROP_EXPOSURE, float(val))
+        except Exception:
+            return False
+
+    def get_exposure(self):
+        return self._get_exposure_basler() if self.use_basler else self._get_exposure_opencv()
+
+    def set_exposure(self, val):
+        val = float(np.clip(val, self.min_exposure, self.max_exposure))
+        if self.use_basler:
+            return self._set_exposure_basler(val)
+        return self._set_exposure_opencv(val)
+
+    def step_exposure(self, direction=1):
+        """direction: +1 increase exposure (brighter), -1 decrease exposure (darker)"""
+        now = time.time()
+        if now - self.last_change < self.min_interval_s:
+            return False
+        cur = self.get_exposure()
+        if cur is None:
+            return False
+        # compute multiplicative step
+        if cur == 0:
+            new = cur + direction * 1.0
+        else:
+            new = cur * (1.0 + direction * self.step_pct)
+        new = float(np.clip(new, self.min_exposure, self.max_exposure))
+        ok = self.set_exposure(new)
+        if ok:
+            self.last_change = now
+        return ok
+
+
 # -------------------- main --------------------
 def main():
     ap = argparse.ArgumentParser(description="Single-view overlay with Sharpness + Lighting metrics")
     ap.add_argument("--master", required=True, help="Path to MASTER image")
     ap.add_argument("--basler", action="store_true", help="Use Basler via pypylon")
+    ap.add_argument("--auto-exposure", action="store_true", help="Enable automatic exposure adjustments when lighting is out-of-range")
+    ap.add_argument("--ae-step", type=float, default=0.12, help="Relative exposure step size (fraction)")
+    ap.add_argument("--ae-interval", type=float, default=1.0, help="Minimum seconds between AE adjustments")
     ap.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
     ap.add_argument("--alpha",  type=float, default=0.40, help="Overlay alpha (0..1)")
     args = ap.parse_args()
@@ -233,6 +326,30 @@ def main():
             return
         print(f"[CAM] OpenCV index {args.camera}")
 
+    # Setup Auto Exposure controller
+    ae = None
+    if args.auto_exposure:
+        # Determine safe AE bounds (best-effort). For Basler, exposures are often in microseconds.
+        if use_basler:
+            # try to read some camera properties to bound exposure if available
+            min_exp = -1e9; max_exp = 1e9
+            try:
+                if hasattr(camera, 'ExposureTimeMin'):
+                    min_exp = float(camera.ExposureTimeMin.GetValue())
+                if hasattr(camera, 'ExposureTimeMax'):
+                    max_exp = float(camera.ExposureTimeMax.GetValue())
+            except Exception:
+                pass
+            ae = AutoExposureController(camera=camera, use_basler=True,
+                                        min_exposure=min_exp, max_exposure=max_exp,
+                                        step_pct=float(args.ae_step), min_interval_s=float(args.ae_interval))
+        else:
+            # OpenCV exposures are driver-specific; use wide safe bounds and let the driver clamp
+            ae = AutoExposureController(cap=cap, use_basler=False,
+                                        min_exposure=-100000.0, max_exposure=100000.0,
+                                        step_pct=float(args.ae_step), min_interval_s=float(args.ae_interval))
+        print(f"[AE] Auto-exposure enabled (step={args.ae_step}, interval={args.ae_interval}s)")
+
     alpha = float(np.clip(args.alpha, 0.0, 1.0))
     show_overlay = True
     win = "LIVE + MASTER overlay (Sharpness & Lighting)"
@@ -258,6 +375,29 @@ def main():
 
         # HUD: metrics and suggestion
         draw_metrics_hud(out, M, T)
+
+        # Auto-exposure logic: only act on lighting severity WARN/CRIT and when AE enabled
+        if ae is not None:
+            info = compute_metrics(M, T)
+            # If lighting is too dark (mean negative delta) -> increase exposure
+            if info['sev_light'] in ("WARN", "CRIT"):
+                # Prefer to act on mean delta first
+                mean_delta = info['mean_delta']
+                std_pct = info['std_pct']
+                clip_pp = info['clip_pp']
+                acted = False
+                # If clipped high, reduce exposure
+                if clip_pp > THRESH['clip_warn']:
+                    acted = ae.step_exposure(direction=-1)
+                    if acted: print(f"[AE] Reduced exposure due to clipping (clip_pp={clip_pp:.2f})")
+                # If too dark (mean_delta negative beyond warn), increase exposure
+                if not acted and mean_delta < -THRESH['mean_warn']:
+                    acted = ae.step_exposure(direction=1)
+                    if acted: print(f"[AE] Increased exposure (mean_delta={mean_delta:+.2f})")
+                # If contrast very low, try increasing exposure slightly
+                if not acted and std_pct < THRESH['std_warn']:
+                    acted = ae.step_exposure(direction=1)
+                    if acted: print(f"[AE] Increased exposure to help low contrast (std_pct={std_pct:+.2f}%)")
 
         # Small help line
         cv2.putText(out, f"[o] overlay {'ON' if show_overlay else 'OFF'}   alpha={alpha:.2f}   [+/-] adjust   [s] save   [q] quit",
