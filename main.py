@@ -1,6 +1,170 @@
 from pypylon import pylon
 import cv2
 import numpy as np
+import time
+
+# --- thresholds for AE/metrics (copied from live-compare-overlay)
+THRESH = {
+    "sharp_warn": -10.0, "sharp_crit": -20.0,
+    "mean_warn":  10.0,  "mean_crit":  15.0,
+    "std_warn":   -10.0, "std_crit":   -20.0,
+    "clip_warn":   1.0,  "clip_crit":   2.0,
+}
+
+
+# --- metrics helpers (tenengrad, exposure, analyze, compute_metrics)
+def tenengrad(gray: np.ndarray) -> float:
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, 3)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, 3)
+    return float(np.mean(gx**2 + gy**2))
+
+def exposure(gray: np.ndarray):
+    mean = float(np.mean(gray))
+    std  = float(np.std(gray))
+    hist = cv2.calcHist([gray],[0],None,[256],[0,256]).ravel()
+    total = gray.size
+    clip = float(hist[:2].sum() + hist[254:].sum()) / total
+    return mean, std, clip
+
+def analyze(img_bgr: np.ndarray):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    mean, std, clip = exposure(gray)
+    sharp = tenengrad(gray)
+    return {"image": img_bgr, "mean": mean, "std": std, "clip": clip, "sharp": sharp}
+
+def sev_label(value, warn, crit, invert=False):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "CRIT", (66,66,255)
+    if invert:
+        level = abs(value)
+        if level >= crit: return "CRIT", (66,66,255)
+        if level >= warn: return "WARN", (32,176,255)
+        return "OK", (107,191,32)
+    else:
+        if value <= crit: return "CRIT", (66,66,255)
+        if value <= warn: return "WARN", (32,176,255)
+        return "OK", (107,191,32)
+
+def compute_metrics(master, live):
+    sharp_pct  = 100.0*(live['sharp']/master['sharp'] - 1.0) if master['sharp'] > 1e-9 else float('nan')
+    mean_delta = live['mean'] - master['mean']
+    std_pct    = 100.0*(live['std']/master['std'] - 1.0) if master['std'] > 1e-9 else float('nan')
+    clip_pp    = (live['clip'] - master['clip']) * 100.0
+
+    sev_sharp, col_sharp = sev_label(sharp_pct, THRESH['sharp_warn'], THRESH['sharp_crit'])
+    s_mean,_ = sev_label(mean_delta, THRESH['mean_warn'], THRESH['mean_crit'], invert=True)
+    s_std,_  = sev_label(std_pct,    THRESH['std_warn'],  THRESH['std_crit'])
+    s_clip,_ = sev_label(clip_pp,    THRESH['clip_warn'], THRESH['clip_crit'], invert=True)
+    sev_map = {"OK":1,"WARN":2,"CRIT":3}
+    lighting_lvl = max(sev_map[s_mean], sev_map[s_std], sev_map[s_clip])
+    sev_light = {1:"OK",2:"WARN",3:"CRIT"}[lighting_lvl]
+
+    suggestions = []
+    if sev_sharp in ("WARN","CRIT"):
+        suggestions.append("FOCUS CAMERA")
+    if sev_light in ("WARN","CRIT"):
+        if mean_delta < -THRESH['mean_warn']:
+            suggestions.append("Increase brightness/exposure")
+        elif mean_delta > THRESH['mean_warn']:
+            suggestions.append("Decrease brightness/exposure")
+        if std_pct < THRESH['std_warn']:
+            suggestions.append("Increase contrast")
+        if clip_pp > THRESH['clip_warn']:
+            suggestions.append("Reduce exposure to avoid clipping")
+
+    return {
+        "sharp_pct": sharp_pct,
+        "mean_delta": mean_delta,
+        "std_pct": std_pct,
+        "clip_pp": clip_pp,
+        "sev_sharp": sev_sharp,
+        "sev_light": sev_light,
+        "suggestion": " | ".join(suggestions) if suggestions else "—"
+    }
+
+
+class AutoExposureController:
+    """Auto-exposure controller similar to live-compare-overlay."""
+    def __init__(self, *, camera=None, cap=None, use_basler=False,
+                 min_exposure=-100000.0, max_exposure=100000.0,
+                 step_pct=0.1, min_interval_s=1.0):
+        self.camera = camera
+        self.cap = cap
+        self.use_basler = use_basler
+        self.min_exposure = min_exposure
+        self.max_exposure = max_exposure
+        self.step_pct = step_pct
+        self.min_interval_s = min_interval_s
+        self.last_change = 0.0
+
+    def _get_exposure_basler(self):
+        try:
+            if not self.camera:
+                return None
+            if hasattr(self.camera, 'ExposureTime'):
+                return float(self.camera.ExposureTime.GetValue())
+            if hasattr(self.camera, 'ExposureTimeAbs'):
+                return float(self.camera.ExposureTimeAbs.GetValue())
+        except Exception:
+            return None
+
+    def _set_exposure_basler(self, val):
+        try:
+            if not self.camera:
+                return False
+            if hasattr(self.camera, 'ExposureTime'):
+                self.camera.ExposureTime.SetValue(int(val))
+                return True
+            if hasattr(self.camera, 'ExposureTimeAbs'):
+                self.camera.ExposureTimeAbs.SetValue(float(val))
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _get_exposure_opencv(self):
+        try:
+            if not self.cap:
+                return None
+            val = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+            return float(val) if val is not None and val != -1 else None
+        except Exception:
+            return None
+
+    def _set_exposure_opencv(self, val):
+        try:
+            if not self.cap:
+                return False
+            return self.cap.set(cv2.CAP_PROP_EXPOSURE, float(val))
+        except Exception:
+            return False
+
+    def get_exposure(self):
+        return self._get_exposure_basler() if self.use_basler else self._get_exposure_opencv()
+
+    def set_exposure(self, val):
+        val = float(np.clip(val, self.min_exposure, self.max_exposure))
+        if self.use_basler:
+            return self._set_exposure_basler(val)
+        return self._set_exposure_opencv(val)
+
+    def step_exposure(self, direction=1):
+        now = time.time()
+        if now - self.last_change < self.min_interval_s:
+            return False
+        cur = self.get_exposure()
+        if cur is None:
+            return False
+        if cur == 0:
+            new = cur + direction * 1.0
+        else:
+            new = cur * (1.0 + direction * self.step_pct)
+        new = float(np.clip(new, self.min_exposure, self.max_exposure))
+        ok = self.set_exposure(new)
+        if ok:
+            self.last_change = now
+        return ok
+
 
 # Global variables for point selection
 selected_points = []
@@ -181,6 +345,23 @@ best_outside_pts = None
 best_outside_score = -1
 best_bbox_pts = None
 best_outside_bbox_pts = None
+MASTER_METRICS = None
+
+# Setup AutoExposureController for Basler camera (best-effort)
+ae = None
+try:
+    min_exp = -1e9; max_exp = 1e9
+    try:
+        if hasattr(camera, 'ExposureTimeMin'):
+            min_exp = float(camera.ExposureTimeMin.GetValue())
+        if hasattr(camera, 'ExposureTimeMax'):
+            max_exp = float(camera.ExposureTimeMax.GetValue())
+    except Exception:
+        pass
+    ae = AutoExposureController(camera=camera, use_basler=True, min_exposure=min_exp, max_exposure=max_exp, step_pct=0.12, min_interval_s=1.0)
+    print('[AE] Auto-exposure controller created for Basler')
+except Exception:
+    ae = None
 
 # Create window and set mouse callback for point selection
 cv2.namedWindow("Rectangle Detection & Matching", cv2.WINDOW_AUTOSIZE)
@@ -193,6 +374,16 @@ print("Loading reference.jpg...")
 if not load_reference_image():
     print("Failed to load reference image. Exiting.")
     exit(1)
+
+# Compute master metrics for AE comparisons
+MASTER_METRICS = None
+try:
+    ref_img = cv2.imread('reference.jpg')
+    if ref_img is not None:
+        MASTER_METRICS = analyze(ref_img)
+        print('[AE] Master metrics computed from reference.jpg')
+except Exception:
+    MASTER_METRICS = None
 
 print("\n=== SETUP MODE ===")
 print("Optional: Click 4 points on the image to define search region")
@@ -447,6 +638,31 @@ while camera.IsGrabbing():
                         print(f"Top 3 inside candidates: {[(c[2], c[3], c[4]) for c in all_candidates[:3]]}")  # score, w, h
                     if len(outside_candidates) > 0:
                         print(f"Top 3 outside candidates: {[(c[2], c[3], c[4]) for c in outside_candidates[:3]]}")  # score, w, h
+
+                # Auto-exposure logic (only when we have master metrics and AE controller)
+                try:
+                    if ae is not None and MASTER_METRICS is not None:
+                        live_metrics = analyze(frame_resized)
+                        info = compute_metrics(MASTER_METRICS, live_metrics)
+                        if info['sev_light'] in ('WARN', 'CRIT'):
+                            acted = False
+                            # Reduce exposure if clipping
+                            if info['clip_pp'] > THRESH['clip_warn']:
+                                acted = ae.step_exposure(direction=-1)
+                                if acted:
+                                    print(f"[AE] Reduced exposure due to clipping (clip_pp={info['clip_pp']:.2f})")
+                            # Increase exposure if too dark
+                            if not acted and info['mean_delta'] < -THRESH['mean_warn']:
+                                acted = ae.step_exposure(direction=1)
+                                if acted:
+                                    print(f"[AE] Increased exposure (mean_delta={info['mean_delta']:+.2f})")
+                            # Try increasing exposure for very low contrast
+                            if not acted and info['std_pct'] < THRESH['std_warn']:
+                                acted = ae.step_exposure(direction=1)
+                                if acted:
+                                    print(f"[AE] Increased exposure to help low contrast (std_pct={info['std_pct']:+.2f}%)")
+                except Exception:
+                    pass
 
             # --- Draw detection results ---
             display_frame = frame_resized.copy()
